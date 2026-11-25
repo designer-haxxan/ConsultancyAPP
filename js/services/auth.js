@@ -1,77 +1,64 @@
-// Local owner sign-in. The password is stored only as a PBKDF2-SHA256 hash in this browser's database.
-// This protects the screen, not the data: anyone with the device and developer tools can read the database,
-// so use a device lock screen as well.
+// Sign-in through the eposwala account API (the same accounts the POS app uses).
+//
+//   POST {AUTH_API_BASE}/login   { username, password, deviceId }
+//   2xx -> { token, expiresAt (unix ms), username }
+//   !2xx -> { error: 'missing_fields' | 'invalid_credentials' | 'device_mismatch' | 'account_disabled' }
+//
+// The API binds each account to one device (deviceId). The password is sent to the API only and is never stored.
+// The session (token + expiry) is kept on this device, so the app works offline until the session expires.
 import { CONFIG, storageKey } from '../config.js';
 import { metaGet, metaSet } from '../db/idb.js';
 
 const SESSION_KEY = storageKey('session');
-const LOCK_KEY = storageKey('lock');
-const enc = new TextEncoder();
+const DEVICE_KEY = storageKey('deviceId');
 
-const toB64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
-const fromB64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+const ERRORS = {
+  missing_fields: 'Enter your username and password.',
+  invalid_credentials: 'Wrong username or password.',
+  device_mismatch: `This account is linked to another device. Ask eposwala support to move it: ${CONFIG.SUPPORT_PHONE}.`,
+  account_disabled: `This account is disabled. Contact eposwala support: ${CONFIG.SUPPORT_PHONE}.`,
+};
 
-async function derive(password, salt, iterations) {
-  if (!crypto?.subtle) throw new Error('This browser cannot secure the password. Open the app over HTTPS or localhost.');
-  const key = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations, hash: 'SHA-256' }, key, 256);
-  return toB64(bits);
-}
-
-export async function hasAccount() {
-  return !!(await metaGet('auth'));
-}
-
-export async function getAccount() {
-  return metaGet('auth', null);
-}
-
-export async function createAccount({ username, password, name }) {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iterations = CONFIG.PBKDF2_ITERATIONS;
-  const hash = await derive(password, salt, iterations);
-  const account = { username: username.toLowerCase(), name, salt: toB64(salt), iterations, hash, createdAt: new Date().toISOString() };
-  await metaSet('auth', account);
-  startSession(account.username);
-  return account;
+// A random id per browser, created once. The API uses it for the one-device rule.
+export function deviceId() {
+  let id = null;
+  try { id = localStorage.getItem(DEVICE_KEY); } catch { /* storage blocked */ }
+  if (!id) {
+    id = crypto.randomUUID ? crypto.randomUUID() : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+    try { localStorage.setItem(DEVICE_KEY, id); } catch { /* ignore: a new id is created next time */ }
+  }
+  return id;
 }
 
 export async function signIn(username, password) {
-  const lock = readLock();
-  if (lock.until > Date.now()) {
-    const secs = Math.ceil((lock.until - Date.now()) / 1000);
-    throw new Error(`Too many attempts. Wait ${secs} seconds and try again.`);
+  const user = String(username || '').trim();
+  if (!user || !password) throw new Error(ERRORS.missing_fields);
+  let res;
+  try {
+    res = await fetch(`${CONFIG.AUTH_API_BASE}/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: user, password, deviceId: deviceId() }),
+      cache: 'no-store',
+      credentials: 'omit',
+      referrerPolicy: 'no-referrer',
+    });
+  } catch {
+    throw new Error('Could not reach the sign-in server. Check the internet connection and try again.');
   }
-  const acc = await getAccount();
-  const ok = acc && acc.username === username.trim().toLowerCase()
-    && (await derive(password, fromB64(acc.salt), acc.iterations)) === acc.hash;
-  if (!ok) {
-    const fails = lock.fails + 1;
-    localStorage.setItem(LOCK_KEY, JSON.stringify({ fails: fails >= 5 ? 0 : fails, until: fails >= 5 ? Date.now() + 30000 : 0 }));
-    throw new Error('Wrong username or password.');
+  let body = {};
+  try { body = await res.json(); } catch { /* non-JSON error page */ }
+  if (!res.ok || !body.token) {
+    if (res.status >= 500) throw new Error('The sign-in server is unavailable right now. Try again later.');
+    throw new Error(ERRORS[body.error] || 'Sign-in failed. Try again.');
   }
-  localStorage.removeItem(LOCK_KEY);
-  startSession(acc.username);
-  return acc;
+  const exp = Number(body.expiresAt) > Date.now() ? Number(body.expiresAt) : Date.now() + CONFIG.SESSION_HOURS * 3600 * 1000;
+  const session = { username: body.username || user, token: body.token, exp };
+  try { localStorage.setItem(SESSION_KEY, JSON.stringify(session)); } catch { /* session lasts this page load */ }
+  sessionMemory = session;
+  return session;
 }
 
-export async function changePassword(current, next) {
-  const acc = await getAccount();
-  if ((await derive(current, fromB64(acc.salt), acc.iterations)) !== acc.hash) throw new Error('The current password is wrong.');
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const hash = await derive(next, salt, acc.iterations);
-  await metaSet('auth', { ...acc, salt: toB64(salt), hash });
-}
-
-function readLock() {
-  try { return { fails: 0, until: 0, ...JSON.parse(localStorage.getItem(LOCK_KEY) || '{}') }; } catch { return { fails: 0, until: 0 }; }
-}
-
-export function startSession(username) {
-  const exp = Date.now() + CONFIG.SESSION_HOURS * 3600 * 1000;
-  try { localStorage.setItem(SESSION_KEY, JSON.stringify({ username, exp })); } catch { /* storage blocked: session lasts this page load */ }
-  sessionMemory = { username, exp };
-}
 let sessionMemory = null;
 
 export function currentSession() {
@@ -79,11 +66,25 @@ export function currentSession() {
   if (!s) {
     try { s = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); } catch { s = null; }
   }
-  if (!s || !s.exp || s.exp < Date.now()) return null;
+  if (!s || !s.token || !s.exp || s.exp < Date.now()) return null;
   return s;
 }
 
 export function endSession() {
   sessionMemory = null;
   try { localStorage.removeItem(SESSION_KEY); } catch { /* ignore */ }
+}
+
+// The account whose data this device holds: { username, name }. Null on a fresh device.
+export const getAccount = () => metaGet('auth', null);
+
+export async function saveAccount(account) {
+  await metaSet('auth', { ...account, linkedAt: (await getAccount())?.linkedAt || new Date().toISOString() });
+}
+
+// Returns the username that owns the data on this device when it differs from `username`, otherwise null.
+export async function ownerMismatch(username) {
+  const acc = await getAccount();
+  if (!acc || !acc.username) return null;
+  return acc.username.toLowerCase() === String(username).toLowerCase() ? null : acc.username;
 }

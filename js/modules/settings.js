@@ -44,16 +44,11 @@ export async function render(root, ctx) {
       </form>
 
       <div class="stack">
-        <form class="panel reveal" id="pw" novalidate>
-          <div class="panel-head"><h2>Password</h2></div>
-          <p class="muted small">Signed in as <b>${esc(acc?.username || '')}</b>. Use at least 8 characters.</p>
-          <div class="form-grid">
-            ${UI.field({ name: 'current', label: 'Current password', type: 'password', required: true, autocomplete: 'current-password', full: true })}
-            ${UI.field({ name: 'next', label: 'New password', type: 'password', required: true, autocomplete: 'new-password' })}
-            ${UI.field({ name: 'confirm', label: 'Repeat new password', type: 'password', required: true, autocomplete: 'new-password' })}
-          </div>
-          <div class="mt-3"><button class="btn btn-ghost" type="submit">Change password</button></div>
-        </form>
+        <section class="panel reveal">
+          <div class="panel-head"><h2>Account</h2></div>
+          <p class="muted small">Signed in as <b>${esc(acc?.username || '')}</b>. This account is managed by eposwala, so passwords are changed there. Each account is linked to one device.</p>
+          <p class="muted small mt-2">Changing phones or clearing this browser's data needs eposwala support: ${esc(CONFIG.SUPPORT_PHONE)}.</p>
+        </section>
 
         <section class="panel reveal" style="--d:60ms">
           <div class="panel-head"><h2>Backup</h2>${s.lastBackupAt ? `<span class="chip chip-success">${UI.icon('check2')} ${esc(fmtDateTime(s.lastBackupAt))}</span>` : '<span class="chip chip-warn">Never backed up</span>'}</div>
@@ -92,18 +87,6 @@ export async function render(root, ctx) {
     });
     UI.toast('Profile saved');
     ctx.refresh();
-  });
-  root.querySelector('#pw').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    if (!e.target.reportValidity()) return;
-    const v = UI.readForm(e.target);
-    try {
-      if (v.next.length < 8) throw new Error('The new password must be at least 8 characters.');
-      if (v.next !== v.confirm) throw new Error('The new passwords do not match.');
-      await Auth.changePassword(v.current, v.next);
-      e.target.reset();
-      UI.toast('Password changed');
-    } catch (err) { UI.toast(err.message, 'danger', 5000); }
   });
   root.querySelector('#restore-file').addEventListener('change', async (e) => {
     const file = e.target.files?.[0];

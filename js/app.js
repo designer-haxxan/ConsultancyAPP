@@ -1,4 +1,4 @@
-// App bootstrap: theme, local sign-in / setup, app shell, router, search and quick actions.
+// App bootstrap: theme, eposwala sign-in, agency setup, app shell, router, search and quick actions.
 import { CONFIG } from './config.js';
 import { openDB } from './db/idb.js';
 import * as Auth from './services/auth.js';
@@ -33,7 +33,7 @@ const NAV = [
 
 let routeToken = 0;
 let expiryTimer = null;
-let settingsCache = null;
+let accountCache = null;
 
 // ---------- Theme ----------
 function applyTheme(choice) {
@@ -68,14 +68,9 @@ function fatal(message) {
   wrap.innerHTML = `<div class="fatal card-plain"><div class="empty-icon">${UI.icon('exclamation-octagon')}</div><h2>Something stopped the app</h2><p>${esc(message)}</p><button class="btn btn-primary" onclick="location.reload()">Try again</button></div>`;
 }
 
-// ---------- Sign-in & setup ----------
-function showAuth(mode, notice = '') {
-  hideSplash();
-  $('#view-app').hidden = true;
-  const wrap = $('#view-auth');
-  wrap.hidden = false;
-  const isSetup = mode === 'setup';
-  wrap.innerHTML = `
+// ---------- Sign-in & agency setup ----------
+function authShell({ title, lead, body, foot }) {
+  return `
   <div class="auth">
     <div class="auth-bg" aria-hidden="true"><span class="blob b1"></span><span class="blob b2"></span><span class="blob b3"></span></div>
     <section class="auth-hero">
@@ -84,7 +79,7 @@ function showAuth(mode, notice = '') {
         <div><div class="brand-name">${esc(CONFIG.APP_NAME)}</div><div class="brand-tag">Visa consultancy · Pakistan</div></div>
       </div>
       <h1 class="hero-title reveal" style="--d:80ms">Every visa file, <span class="grad">on one screen.</span></h1>
-      <p class="hero-lead reveal" style="--d:140ms">Clients, documents, appointments, fees and decisions for every country. Works offline. Built for Pakistani consultancies that run on WhatsApp and paper.</p>
+      <p class="hero-lead reveal" style="--d:140ms">Clients, documents, appointments, fees and decisions for every country. Works offline once you have signed in. Built for Pakistani consultancies that run on WhatsApp and paper.</p>
       <div class="hero-scene reveal" style="--d:200ms" aria-hidden="true">
         <svg viewBox="0 0 560 300" class="scene-svg">
           <defs>
@@ -122,7 +117,7 @@ function showAuth(mode, notice = '') {
         </svg>
       </div>
       <ul class="hero-chips reveal" style="--d:260ms">
-        <li>${UI.icon('wifi-off')} Works offline</li>
+        <li>${UI.icon('wifi-off')} Works offline after sign-in</li>
         <li>${UI.icon('file-earmark-check')} Document checklists</li>
         <li>${UI.icon('cash-coin')} PKR receipts</li>
         <li>${UI.icon('whatsapp')} WhatsApp updates</li>
@@ -130,57 +125,105 @@ function showAuth(mode, notice = '') {
     </section>
 
     <section class="auth-card reveal" style="--d:120ms" aria-labelledby="auth-title">
-      <div class="auth-card-head">
-        <h2 id="auth-title">${isSetup ? 'Set up your agency' : 'Welcome back'}</h2>
-        <p>${isSetup ? 'Create the owner account. Everything stays on this device.' : 'Sign in to open your files.'}</p>
-      </div>
-      ${notice ? `<div class="notice notice-warn">${UI.icon('info-circle')}<span>${esc(notice)}</span></div>` : ''}
-      <form id="auth-form" novalidate>
-        ${isSetup ? `
-          ${UI.field({ name: 'agencyName', label: 'Consultancy name', required: true, placeholder: 'e.g. Al-Noor Visa Services', autocomplete: 'organization' })}
-          ${UI.field({ name: 'ownerName', label: 'Your full name', required: true, autocomplete: 'name' })}` : ''}
-        ${UI.field({ name: 'username', label: 'Username', required: true, autocomplete: 'username', placeholder: 'e.g. owner' })}
-        ${UI.field({ name: 'password', label: 'Password', type: 'password', required: true, autocomplete: isSetup ? 'new-password' : 'current-password', hint: isSetup ? 'At least 8 characters. Keep it safe: it cannot be recovered.' : '' })}
-        ${isSetup ? UI.field({ name: 'confirm', label: 'Confirm password', type: 'password', required: true, autocomplete: 'new-password' }) : ''}
-        <div class="form-error" id="auth-error" role="alert" hidden></div>
-        <button class="btn btn-primary btn-block btn-lg" type="submit" id="auth-submit">
-          <span>${isSetup ? 'Create account & open app' : 'Sign in'}</span>${UI.icon('arrow-right')}
-        </button>
-      </form>
-      <p class="auth-foot">${isSetup ? 'Passwords are stored only as a secure hash on this device.' : 'Forgot the password? Restore a backup on this device, or reset the app (this deletes data).'}</p>
+      <div class="auth-card-head"><h2 id="auth-title">${esc(title)}</h2><p>${esc(lead)}</p></div>
+      ${body}
+      <p class="auth-foot">${foot}</p>
     </section>
   </div>`;
-  const form = $('#auth-form', wrap);
+}
+
+function showFormError(wrap, msg) {
   const err = $('#auth-error', wrap);
+  err.textContent = msg;
+  err.hidden = false;
+  const card = wrap.querySelector('.auth-card');
+  card?.classList.remove('shake');
+  void card?.offsetWidth;
+  card?.classList.add('shake');
+}
+
+function showSignIn(notice = '') {
+  hideSplash();
+  $('#view-app').hidden = true;
+  const wrap = $('#view-auth');
+  wrap.hidden = false;
+  wrap.innerHTML = authShell({
+    title: 'Welcome back',
+    lead: 'Sign in with your eposwala account to open your files.',
+    body: `${notice ? `<div class="notice notice-warn">${UI.icon('info-circle')}<span>${esc(notice)}</span></div>` : ''}
+      <form id="auth-form" novalidate>
+        ${UI.field({ name: 'username', label: 'Username', required: true, autocomplete: 'username', autocapitalize: 'none', placeholder: 'your eposwala username' })}
+        ${UI.field({ name: 'password', label: 'Password', type: 'password', required: true, autocomplete: 'current-password' })}
+        <div class="form-error" id="auth-error" role="alert" hidden></div>
+        <button class="btn btn-primary btn-block btn-lg" type="submit" id="auth-submit"><span>Sign in</span>${UI.icon('arrow-right')}</button>
+      </form>`,
+    foot: `Needs an internet connection the first time, and after the session ends. Forgot the password? Reset it at eposwala.com. Support: ${esc(CONFIG.SUPPORT_PHONE)}.`,
+  });
+  const form = $('#auth-form', wrap);
   const submit = $('#auth-submit', wrap);
   setTimeout(() => form.querySelector('input')?.focus(), 150);
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const v = UI.readForm(form);
-    err.hidden = true;
+    $('#auth-error', wrap).hidden = true;
+    submit.disabled = true;
+    submit.querySelector('span').textContent = 'Signing in…';
     try {
-      submit.disabled = true;
-      if (isSetup) {
-        if (!v.agencyName || !v.ownerName) throw new Error('Enter the consultancy name and your name.');
-        if (!/^[a-zA-Z0-9._-]{3,}$/.test(v.username)) throw new Error('Username: 3+ letters, numbers, dot, dash or underscore.');
-        if (v.password.length < 8) throw new Error('Password must be at least 8 characters.');
-        if (v.password !== v.confirm) throw new Error('The two passwords do not match.');
-        await Auth.createAccount({ username: v.username, password: v.password, name: v.ownerName });
-        await D.saveSettings({ agencyName: v.agencyName, ownerName: v.ownerName, staff: [v.ownerName] });
-        await D.seedCatalog();
-      } else {
-        if (!v.username || !v.password) throw new Error('Enter your username and password.');
-        await Auth.signIn(v.username, v.password);
-      }
-      await startApp();
+      const session = await Auth.signIn(v.username, v.password);
+      form.password.value = '';
+      await completeSignIn(session.username);
     } catch (ex) {
-      err.textContent = ex.message || String(ex);
-      err.hidden = false;
-      wrap.querySelector('.auth-card')?.classList.remove('shake');
-      void wrap.querySelector('.auth-card')?.offsetWidth;
-      wrap.querySelector('.auth-card')?.classList.add('shake');
+      showFormError(wrap, ex.message || String(ex));
     } finally {
       submit.disabled = false;
+      submit.querySelector('span').textContent = 'Sign in';
+    }
+  });
+}
+
+// After the API accepts the password: check the device owner, then open the agency setup or the app.
+async function completeSignIn(username) {
+  const other = await Auth.ownerMismatch(username);
+  if (other) {
+    Auth.endSession();
+    throw new Error(`This device holds the data of "${other}". Sign in as them, or erase this device in Settings before using another account.`);
+  }
+  const acc = await Auth.getAccount();
+  await Auth.saveAccount({ username: username.toLowerCase(), name: acc?.name || username });
+  await D.seedCatalog();
+  const settings = await D.getSettings();
+  if (!settings.agencyName) return showSetup(username);
+  return startApp();
+}
+
+function showSetup(username) {
+  hideSplash();
+  $('#view-app').hidden = true;
+  const wrap = $('#view-auth');
+  wrap.hidden = false;
+  wrap.innerHTML = authShell({
+    title: 'Set up your agency',
+    lead: 'Two details for receipts and file cover sheets. You can change them later in Settings.',
+    body: `<form id="auth-form" novalidate>
+        ${UI.field({ name: 'agencyName', label: 'Consultancy name', required: true, placeholder: 'e.g. Al-Noor Visa Services', autocomplete: 'organization' })}
+        ${UI.field({ name: 'ownerName', label: 'Your full name', required: true, value: '', autocomplete: 'name', hint: `Signed in as ${username}` })}
+        <div class="form-error" id="auth-error" role="alert" hidden></div>
+        <button class="btn btn-primary btn-block btn-lg" type="submit" id="auth-submit"><span>Open the app</span>${UI.icon('arrow-right')}</button>
+      </form>`,
+    foot: 'Everything you enter stays on this device.',
+  });
+  const form = $('#auth-form', wrap);
+  setTimeout(() => form.querySelector('input')?.focus(), 150);
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const v = UI.readForm(form);
+    try {
+      if (!v.agencyName || !v.ownerName) throw new Error('Enter the consultancy name and your name.');
+      await D.saveSettings({ agencyName: v.agencyName, ownerName: v.ownerName, staff: [v.ownerName] });
+      await Auth.saveAccount({ username: username.toLowerCase(), name: v.ownerName });
+      await startApp();
+    } catch (ex) {
+      showFormError(wrap, ex.message || String(ex));
     }
   });
 }
@@ -205,17 +248,20 @@ function buildNav() {
 function paintShell(settings) {
   const name = settings.agencyName || CONFIG.APP_NAME;
   $('#brand-name').textContent = name;
-  const acc = settingsCache?.account;
-  const owner = settings.ownerName || acc?.name || 'Owner';
+  const owner = settings.ownerName || accountCache?.name || 'Owner';
   $('#user-name').textContent = owner;
-  $('#user-role').textContent = 'Owner · this device';
+  $('#user-role').textContent = accountCache?.username ? `${accountCache.username} · this device` : 'Owner · this device';
   $('#user-avatar').textContent = initials(owner);
 }
 
 async function startApp() {
+  const session = Auth.currentSession();
+  if (!session) return showSignIn('Your session has ended. Sign in again to continue.');
   const [settings, account] = await Promise.all([D.getSettings(), Auth.getAccount()]);
+  if (!account) await Auth.saveAccount({ username: session.username.toLowerCase(), name: settings.ownerName || session.username });
+  accountCache = account || { username: session.username, name: settings.ownerName };
   await D.seedCatalog();
-  settingsCache = { account };
+  if (!settings.agencyName) return showSetup(session.username);
   buildNav();
   paintShell(settings);
   $('#view-auth').hidden = true;
@@ -227,18 +273,18 @@ async function startApp() {
 }
 
 // Session ended (or user pressed Lock). Data is kept; only the screen is locked.
-function lock() {
+function lock(reason = 'Your session has ended. Sign in again to continue.') {
   clearInterval(expiryTimer);
   routeToken++;
   $('#content').innerHTML = '';
-  showAuth('signin', 'Your session has ended. Sign in again to continue.');
+  showSignIn(reason);
 }
 
 function logout() {
-  UI.confirmDialog('Sign out of this device? Your data stays here, and you can sign back in with your password.', { okLabel: 'Sign out', title: 'Sign out', danger: false }).then((ok) => {
+  UI.confirmDialog('Sign out of this device? Your data stays here. Signing in again needs the internet.', { okLabel: 'Sign out', title: 'Sign out', danger: false }).then((ok) => {
     if (!ok) return;
     Auth.endSession();
-    lock();
+    lock('You have signed out.');
   });
 }
 
@@ -366,7 +412,7 @@ function wireShell() {
   $('#bottom-more').addEventListener('click', (e) => { e.preventDefault(); openMore(); });
   $('#user-menu-btn').addEventListener('click', () => $('#user-menu').classList.toggle('open'));
   document.addEventListener('click', (e) => { if (!e.target.closest('.user-wrap')) $('#user-menu')?.classList.remove('open'); });
-  $('#lock-btn').addEventListener('click', () => { $('#user-menu').classList.remove('open'); Auth.endSession(); lock(); });
+  $('#lock-btn').addEventListener('click', () => { $('#user-menu').classList.remove('open'); Auth.endSession(); lock('Screen locked. Sign in to continue.'); });
   $('#logout-btn').addEventListener('click', () => { $('#user-menu').classList.remove('open'); logout(); });
   window.addEventListener('hashchange', () => { if ($('#view-app').hidden === false) route(); });
   document.addEventListener('keydown', (e) => {
@@ -410,13 +456,9 @@ function registerSW() {
     return fatal(e.message || String(e));
   }
   try {
-    const account = await Auth.getAccount();
-    if (!account) {
-      await D.seedCatalog();
-      return showAuth('setup');
-    }
+    await D.seedCatalog();
     if (Auth.currentSession()) return await startApp();
-    return showAuth('signin');
+    return showSignIn();
   } catch (e) {
     console.error(e);
     fatal(e.message || String(e));

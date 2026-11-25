@@ -5,14 +5,17 @@ export const CONFIG = {
   // Namespace for everything stored in the browser. Every app on the same origin must use its own id.
   APP_ID: 'visaflow',
   DB_NAME: 'visaflow_pk',
-  APP_VERSION: '2.0.0',
+  APP_VERSION: '2.1.0',
   // IndexedDB schema version. Bump it when a store or index is added.
   SCHEMA_VERSION: 1,
   BACKUP_VERSION: 1,
   CURRENCY: 'PKR',
-  // Login session length on this device. After it ends the owner signs in again with the local password.
+  // Used when the sign-in API does not send an expiry. Otherwise the session ends when the server says.
   SESSION_HOURS: 12,
-  PBKDF2_ITERATIONS: 210000,
+  // eposwala account API. It accepts requests only from allowed websites (pos.eposwala.com and
+  // designer-haxxan.github.io). Sign-in from other addresses, such as localhost, is blocked by the browser.
+  AUTH_API_BASE: 'https://eposwala.com/api',
+  SUPPORT_PHONE: '0302-8863131',
   MAX_UPLOAD_MB: 15,
   // Images above this size are resized before storing to keep the device database small.
   IMAGE_MAX_SIDE: 1800,

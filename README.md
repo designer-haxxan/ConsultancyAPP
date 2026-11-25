@@ -20,7 +20,7 @@ HTML5 · ES modules · vanilla CSS · IndexedDB · Service Worker · Bootstrap I
 | **Partners & agents** | Sub-agents and referrers. Commission as a percent of the consultancy fee or a fixed amount per file, with per-file overrides. Commission earned, paid and payable. Record payouts. |
 | **Visa catalogue** | 17 countries and 29 visa types seeded (UK, Schengen, US, Canada, Australia, UAE, Saudi Arabia, Qatar, Oman, Türkiye, Malaysia, China, Japan, South Korea, New Zealand, Thailand, Sri Lanka). Add countries and visa types, edit checklists from the library, and add your own items. Changes apply to new files only. |
 | **Reports** | Pick any period. Files opened, approval rate, billed, collected, expenses, net, outstanding. Approvals by country, visa category, 12-month collections, commissions and money still owed. CSV export. |
-| **Settings** | Consultancy profile (licence, SECP, NTN, receipt footer, refund policy), minimum passport validity, team members, password change, full and records-only backups (JSON, with checksum), restore with validation and typed confirmation, storage persistence request, erase-all. |
+| **Settings** | Consultancy profile (licence, SECP, NTN, receipt footer, refund policy), minimum passport validity, team members, account and device link, full and records-only backups (JSON, with checksum), restore with validation and typed confirmation, storage persistence request, erase-all. |
 | **Everywhere** | Dark mode, search (Ctrl+K) across clients, CNICs, phones, passport numbers and file numbers, quick-add menu, responsive layout (sidebar on desktop, bottom navigation and bottom sheets on phones), animated counters and transitions, reduced-motion support. |
 
 Pakistan-specific details: CNIC (13-digit) and mobile (03XX) validation and formatting, PKR with lakh grouping, WhatsApp click-to-chat links, Urdu name field (Jameel Noori Nastaleeq font), family registration certificates and NADRA/HEC/MOFA attestation steps, Protector of Emigrants (BE&OE) clearance and GAMCA medical checklists for Gulf work visas.
@@ -53,7 +53,7 @@ fonts/                  Jameel Noori Nastaleeq (Urdu names and print), licence: 
 js/config.js            App name, IndexedDB name, session length, upload limits, currency
 js/app.js               Boot, sign-in and setup, session lock, router, search, quick-add, theme
 js/db/idb.js            IndexedDB wrapper; each multi-record change runs in one transaction
-js/services/auth.js     Local owner account (PBKDF2-SHA256), sessions, lockout after failed attempts
+js/services/auth.js     eposwala sign-in (login API), device id, session token and expiry
 js/services/data.js     Business rules: cases, documents, files, payments, expenses, partners, commissions
 js/services/catalog-seed.js   Document library, starter countries and visa types
 js/services/backup.js   Backup (JSON + checksum) and validated restore
@@ -70,12 +70,23 @@ Everything lives in IndexedDB `visaflow_pk` on the device. Stores: `clients`, `c
 - **Receipt and file numbers** come from counters inside the same transaction that saves the record, so a failed save does not use up a number.
 - **Deleting** a client or file is blocked when payments exist. Mark it withdrawn instead, so the money stays on record.
 
-### Sign-in
+### Sign-in (eposwala account API)
 
-- The first run creates a local owner account. The password is stored only as a PBKDF2-SHA256 hash (210,000 iterations, random salt).
-- The session lasts 12 hours on the device. The screen locks when the session ends or on demand.
-- After 5 wrong passwords the sign-in pauses for 30 seconds.
-- Backups never contain the password hash. Restoring keeps the sign-in of the device you restore on.
+Sign-in uses the same eposwala accounts as the POS app:
+
+```
+POST https://eposwala.com/api/login   Content-Type: application/json
+{ "username": "...", "password": "...", "deviceId": "<random id kept in this browser>" }
+2xx  -> { "token": "...", "expiresAt": <unix ms>, "username": "..." }
+!2xx -> { "error": "invalid_credentials" | "device_mismatch" | "account_disabled" | "missing_fields" }
+```
+
+- The password is sent to eposwala only. The app does not store it.
+- The session (token and expiry) is kept in this browser. The app works offline until the session expires, then asks for the password again online.
+- **One device per account.** The first sign-in links the account to this browser's `deviceId`. A different phone or a browser with cleared data gets `device_mismatch`, and eposwala support must move the link.
+- **Allowed websites.** eposwala's API only accepts requests from the sites it has allowed: `https://pos.eposwala.com` and `https://designer-haxxan.github.io`. Signing in from `localhost` or another address is blocked by the browser's CORS rules.
+- Each device holds the data of one account. Signing in as a different account on a device with data is refused until the data is erased in Settings.
+- Passwords are changed on eposwala. Backups contain no password and no session token.
 
 ## Run it locally
 
@@ -106,6 +117,8 @@ When you change any file, bump `VERSION` in `service-worker.js` so installed cop
 
 - **No multi-device sync or multi-user accounts.** One owner per device. Several staff members need a shared backup routine or a future server version.
 - **The sign-in protects the screen, not the data.** Anyone with the device and developer tools can read IndexedDB. Use a device lock screen.
+- **The login API is the only server.** Clients, files and payments never leave the device, so there is no sync and no multi-device access.
+- **Device link.** Changing phones or clearing browser data needs eposwala support (`0302-8863131`).
 - **Requirements and fees are templates.** Verify them with each embassy or VFS.
 - **No payment gateway.** JazzCash, Easypaisa and Raast are recorded as payment methods, not charged.
 - **No e-mail or SMS.** WhatsApp messages open in the user's WhatsApp so they can be edited and sent by hand.
