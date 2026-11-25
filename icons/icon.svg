@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="VisaFlow">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#14b8a6"/>
+      <stop offset="1" stop-color="#0b3b5c"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="120" fill="url(#bg)"/>
+  <rect x="122" y="146" width="268" height="212" rx="34" fill="none" stroke="#ffffff" stroke-width="22"/>
+  <rect x="122" y="146" width="268" height="54" rx="34" fill="rgba(255,255,255,.14)"/>
+  <circle cx="256" cy="276" r="58" fill="none" stroke="#fde68a" stroke-width="20"/>
+  <path d="M256 218 C226 250 226 302 256 334 C286 302 286 250 256 218 Z M198 276 H314" fill="none" stroke="#ffffff" stroke-width="12" stroke-linejoin="round"/>
+  <path d="M338 176 L372 150" stroke="#fde68a" stroke-width="24" stroke-linecap="round"/>
+</svg>

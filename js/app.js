@@ -1,217 +1,424 @@
-// Application bootstrap: service worker, database, authentication gate, navigation and routing.
+// App bootstrap: theme, local sign-in / setup, app shell, router, search and quick actions.
 import { CONFIG } from './config.js';
-import { applyTheme, getSettings } from './core/settings.js';
-import * as UI from './core/ui.js';
-import { esc } from './core/utils.js';
 import { openDB } from './db/idb.js';
 import * as Auth from './services/auth.js';
-import * as Catalog from './services/catalog.js';
+import * as D from './services/data.js';
+import * as UI from './core/ui.js';
+import * as Forms from './modules/forms.js';
+import { esc, debounce, initials } from './core/utils.js';
 
-const $ = window.jQuery;
+const $ = (sel, root = document) => root.querySelector(sel);
+const THEME_KEY = 'visaflow.theme';
 
-// Route table: name → [loader, title, permission|null, icon, menu section]
 const ROUTES = {
-  dashboard: [() => import('./modules/dashboard.js'), 'Dashboard', null, 'house', 'Main'],
-  pos: [() => import('./modules/pos.js'), 'New Sale', 'sale.create', 'cart-plus', 'Main'],
-  sales: [() => import('./modules/documents.js'), 'Sales', null, 'receipt', 'Main'],
-  purchase: [() => import('./modules/pos.js'), 'New Purchase', 'purchase.manage', null, null],
-  purchases: [() => import('./modules/documents.js'), 'Purchases', 'purchase.manage', 'bag', 'Main'],
-  returns: [() => import('./modules/documents.js'), 'Returns', null, 'arrow-return-left', 'Main'],
-  products: [() => import('./modules/products.js'), 'Products', null, 'box-seam', 'Inventory'],
-  stock: [() => import('./modules/stock.js'), 'Stock', null, 'boxes', 'Inventory'],
-  customers: [() => import('./modules/parties.js'), 'Customers', null, 'people', 'Parties'],
-  suppliers: [() => import('./modules/parties.js'), 'Suppliers', 'purchase.manage', 'truck', 'Parties'],
-  vouchers: [() => import('./modules/vouchers.js'), 'Cash Book & Payments', 'voucher.create', 'cash-coin', 'Accounts'],
-  accounts: [() => import('./modules/accounts.js'), 'Accounts', 'account.manage', 'bank', 'Accounts'],
-  reports: [() => import('./reports/reports.js'), 'Reports', 'reports.view', 'bar-chart-line', 'Accounts'],
-  backup: [() => import('./modules/backup.js'), 'Backup & Restore', 'backup.export', 'cloud-arrow-down', 'Administration'],
-  settings: [() => import('./modules/settings.js'), 'Settings', null, 'gear', 'Administration'],
+  dashboard: { load: () => import('./modules/dashboard.js'), title: 'Dashboard' },
+  cases: { load: () => import('./modules/cases.js'), title: 'Cases' },
+  clients: { load: () => import('./modules/clients.js'), title: 'Clients' },
+  documents: { load: () => import('./modules/documents.js'), title: 'Documents' },
+  calendar: { load: () => import('./modules/calendar.js'), title: 'Calendar' },
+  money: { load: () => import('./modules/money.js'), title: 'Payments & expenses' },
+  partners: { load: () => import('./modules/partners.js'), title: 'Partners & agents' },
+  reports: { load: () => import('./modules/reports.js'), title: 'Reports' },
+  catalog: { load: () => import('./modules/catalog.js'), title: 'Visa catalogue' },
+  settings: { load: () => import('./modules/settings.js'), title: 'Settings & backup' },
 };
-const FOCUS_ROUTES = new Set(['pos', 'purchase']);
 
-let currentModule = null;
+const NAV = [
+  ['Overview', [['dashboard', 'house-door', 'Dashboard']]],
+  ['Work', [['cases', 'kanban', 'Cases'], ['clients', 'people', 'Clients'], ['documents', 'folder2-open', 'Documents'], ['calendar', 'calendar3', 'Calendar']]],
+  ['Money', [['money', 'cash-stack', 'Payments & expenses'], ['partners', 'diagram-3', 'Partners & agents']]],
+  ['Insights', [['reports', 'bar-chart-line', 'Reports']]],
+  ['Setup', [['catalog', 'globe2', 'Visa catalogue'], ['settings', 'gear', 'Settings & backup']]],
+];
+
 let routeToken = 0;
-let deferredInstall = null;
+let expiryTimer = null;
+let settingsCache = null;
 
-function showView(name) {
-  $('#splash').addClass('d-none');
-  $('#view-login').toggleClass('d-none', name !== 'login');
-  $('#view-app').toggleClass('d-none', name !== 'app');
+// ---------- Theme ----------
+function applyTheme(choice) {
+  let theme = choice;
+  if (!theme) {
+    try { theme = localStorage.getItem(THEME_KEY); } catch { /* ignore */ }
+  }
+  if (theme !== 'light' && theme !== 'dark') theme = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  document.documentElement.dataset.theme = theme;
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.content = theme === 'dark' ? '#0b1220' : '#0f766e';
+  const btn = $('#theme-toggle i');
+  if (btn) btn.className = theme === 'dark' ? 'bi bi-sun' : 'bi bi-moon-stars';
+}
+function toggleTheme() {
+  const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  try { localStorage.setItem(THEME_KEY, next); } catch { /* ignore */ }
+  applyTheme(next);
 }
 
-function fatal(msg) {
-  $('#splash-error').text(msg);
-  $('#splash .spinner-border').addClass('d-none');
+// ---------- Splash / fatal ----------
+function hideSplash() {
+  $('#splash')?.classList.add('gone');
+}
+function fatal(message) {
+  const err = $('#splash-error');
+  if (err) err.textContent = message;
+  $('#splash .spinner')?.classList.add('hidden');
+  hideSplash();
+  const wrap = document.getElementById('view-auth');
+  wrap.hidden = false;
+  wrap.innerHTML = `<div class="fatal card-plain"><div class="empty-icon">${UI.icon('exclamation-octagon')}</div><h2>Something stopped the app</h2><p>${esc(message)}</p><button class="btn btn-primary" onclick="location.reload()">Try again</button></div>`;
 }
 
-// ---------- Service worker & install ----------
-function registerSW() {
-  if (!('serviceWorker' in navigator)) return;
-  if (location.protocol === 'file:') return;
-  // New versions install and activate on their own (see service-worker.js); check whenever the app is opened.
-  navigator.serviceWorker.register('service-worker.js').then((reg) => {
-    const check = () => {
-      if (!navigator.onLine) return;
-      reg.update().catch(() => {});
-      // Other apps on this origin can wipe our offline cache; ask the worker to rebuild it if needed.
-      (reg.active || navigator.serviceWorker.controller)?.postMessage({ type: 'ENSURE_CACHE' });
-    };
-    check();
-    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') check(); });
-    setInterval(check, 60 * 60 * 1000);
-  }).catch((e) => console.warn('Service worker registration failed:', e));
-  // Reload when an update replaces an existing worker, so the page never mixes files from two versions.
-  // (The very first install only takes control; nothing to reload.)
-  let controlled = !!navigator.serviceWorker.controller;
-  let reloading = false;
-  navigator.serviceWorker.addEventListener('controllerchange', () => {
-    if (controlled && !reloading) { reloading = true; location.reload(); }
-    controlled = true;
+// ---------- Sign-in & setup ----------
+function showAuth(mode, notice = '') {
+  hideSplash();
+  $('#view-app').hidden = true;
+  const wrap = $('#view-auth');
+  wrap.hidden = false;
+  const isSetup = mode === 'setup';
+  wrap.innerHTML = `
+  <div class="auth">
+    <div class="auth-bg" aria-hidden="true"><span class="blob b1"></span><span class="blob b2"></span><span class="blob b3"></span></div>
+    <section class="auth-hero">
+      <div class="brand-row reveal">
+        <div class="brand-mark">${brandSvg()}</div>
+        <div><div class="brand-name">${esc(CONFIG.APP_NAME)}</div><div class="brand-tag">Visa consultancy · Pakistan</div></div>
+      </div>
+      <h1 class="hero-title reveal" style="--d:80ms">Every visa file, <span class="grad">on one screen.</span></h1>
+      <p class="hero-lead reveal" style="--d:140ms">Clients, documents, appointments, fees and decisions for every country. Works offline. Built for Pakistani consultancies that run on WhatsApp and paper.</p>
+      <div class="hero-scene reveal" style="--d:200ms" aria-hidden="true">
+        <svg viewBox="0 0 560 300" class="scene-svg">
+          <defs>
+            <linearGradient id="gPass" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fde68a"/><stop offset="1" stop-color="#f59e0b"/></linearGradient>
+            <linearGradient id="gGlobe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5eead4"/><stop offset="1" stop-color="#0f766e"/></linearGradient>
+          </defs>
+          <ellipse cx="280" cy="262" rx="230" ry="16" class="scene-shadow"/>
+          <circle cx="430" cy="130" r="92" fill="url(#gGlobe)" opacity=".9"/>
+          <g class="scene-lines" fill="none" stroke="rgba(255,255,255,.35)" stroke-width="1.4">
+            <ellipse cx="430" cy="130" rx="92" ry="34"/><ellipse cx="430" cy="130" rx="44" ry="92"/><line x1="338" y1="130" x2="522" y2="130"/><path d="M360 80 Q430 110 500 80"/><path d="M360 180 Q430 150 500 180"/>
+          </g>
+          <path id="route" d="M60 220 Q190 40 430 110" fill="none" stroke="rgba(255,255,255,.85)" stroke-width="2.2" stroke-dasharray="6 8" class="route-line"/>
+          <circle cx="60" cy="220" r="7" fill="#fff"/>
+          <circle cx="430" cy="110" r="7" fill="#fbbf24" class="pulse-dot"/>
+          <g class="plane">
+            <path d="M0 -10 L26 0 L0 10 L6 0 Z" fill="#fff" transform="rotate(-18)"/>
+            <animateMotion dur="5.5s" repeatCount="indefinite" rotate="auto" keyPoints="0;1" keyTimes="0;1" calcMode="spline" keySplines="0.4 0 0.2 1"><mpath href="#route"/></animateMotion>
+          </g>
+          <g class="passport-card float-a">
+            <rect x="92" y="112" width="200" height="132" rx="16" fill="url(#gPass)"/>
+            <rect x="92" y="112" width="200" height="30" rx="16" fill="rgba(0,0,0,.12)"/>
+            <rect x="112" y="128" width="58" height="60" rx="8" fill="rgba(255,255,255,.7)"/>
+            <circle cx="141" cy="150" r="10" fill="#0f766e" opacity=".7"/>
+            <path d="M120 180 q21 -18 42 0" fill="#0f766e" opacity=".55"/>
+            <rect x="186" y="132" width="86" height="8" rx="4" fill="rgba(0,0,0,.25)"/>
+            <rect x="186" y="150" width="70" height="6" rx="3" fill="rgba(0,0,0,.18)"/>
+            <rect x="186" y="164" width="78" height="6" rx="3" fill="rgba(0,0,0,.18)"/>
+            <rect x="186" y="186" width="90" height="14" rx="7" fill="#0b3b5c"/>
+            <text x="192" y="196" font-size="9" fill="#fff" font-weight="700">APPROVED</text>
+          </g>
+          <g class="flags float-b">
+            <rect x="236" y="34" width="46" height="30" rx="7" fill="#fff"/><text x="259" y="54" text-anchor="middle" font-size="18">🇬🇧</text>
+            <rect x="290" y="16" width="46" height="30" rx="7" fill="#fff"/><text x="313" y="36" text-anchor="middle" font-size="18">🇺🇸</text>
+          </g>
+        </svg>
+      </div>
+      <ul class="hero-chips reveal" style="--d:260ms">
+        <li>${UI.icon('wifi-off')} Works offline</li>
+        <li>${UI.icon('file-earmark-check')} Document checklists</li>
+        <li>${UI.icon('cash-coin')} PKR receipts</li>
+        <li>${UI.icon('whatsapp')} WhatsApp updates</li>
+      </ul>
+    </section>
+
+    <section class="auth-card reveal" style="--d:120ms" aria-labelledby="auth-title">
+      <div class="auth-card-head">
+        <h2 id="auth-title">${isSetup ? 'Set up your agency' : 'Welcome back'}</h2>
+        <p>${isSetup ? 'Create the owner account. Everything stays on this device.' : 'Sign in to open your files.'}</p>
+      </div>
+      ${notice ? `<div class="notice notice-warn">${UI.icon('info-circle')}<span>${esc(notice)}</span></div>` : ''}
+      <form id="auth-form" novalidate>
+        ${isSetup ? `
+          ${UI.field({ name: 'agencyName', label: 'Consultancy name', required: true, placeholder: 'e.g. Al-Noor Visa Services', autocomplete: 'organization' })}
+          ${UI.field({ name: 'ownerName', label: 'Your full name', required: true, autocomplete: 'name' })}` : ''}
+        ${UI.field({ name: 'username', label: 'Username', required: true, autocomplete: 'username', placeholder: 'e.g. owner' })}
+        ${UI.field({ name: 'password', label: 'Password', type: 'password', required: true, autocomplete: isSetup ? 'new-password' : 'current-password', hint: isSetup ? 'At least 8 characters. Keep it safe: it cannot be recovered.' : '' })}
+        ${isSetup ? UI.field({ name: 'confirm', label: 'Confirm password', type: 'password', required: true, autocomplete: 'new-password' }) : ''}
+        <div class="form-error" id="auth-error" role="alert" hidden></div>
+        <button class="btn btn-primary btn-block btn-lg" type="submit" id="auth-submit">
+          <span>${isSetup ? 'Create account & open app' : 'Sign in'}</span>${UI.icon('arrow-right')}
+        </button>
+      </form>
+      <p class="auth-foot">${isSetup ? 'Passwords are stored only as a secure hash on this device.' : 'Forgot the password? Restore a backup on this device, or reset the app (this deletes data).'}</p>
+    </section>
+  </div>`;
+  const form = $('#auth-form', wrap);
+  const err = $('#auth-error', wrap);
+  const submit = $('#auth-submit', wrap);
+  setTimeout(() => form.querySelector('input')?.focus(), 150);
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const v = UI.readForm(form);
+    err.hidden = true;
+    try {
+      submit.disabled = true;
+      if (isSetup) {
+        if (!v.agencyName || !v.ownerName) throw new Error('Enter the consultancy name and your name.');
+        if (!/^[a-zA-Z0-9._-]{3,}$/.test(v.username)) throw new Error('Username: 3+ letters, numbers, dot, dash or underscore.');
+        if (v.password.length < 8) throw new Error('Password must be at least 8 characters.');
+        if (v.password !== v.confirm) throw new Error('The two passwords do not match.');
+        await Auth.createAccount({ username: v.username, password: v.password, name: v.ownerName });
+        await D.saveSettings({ agencyName: v.agencyName, ownerName: v.ownerName, staff: [v.ownerName] });
+        await D.seedCatalog();
+      } else {
+        if (!v.username || !v.password) throw new Error('Enter your username and password.');
+        await Auth.signIn(v.username, v.password);
+      }
+      await startApp();
+    } catch (ex) {
+      err.textContent = ex.message || String(ex);
+      err.hidden = false;
+      wrap.querySelector('.auth-card')?.classList.remove('shake');
+      void wrap.querySelector('.auth-card')?.offsetWidth;
+      wrap.querySelector('.auth-card')?.classList.add('shake');
+    } finally {
+      submit.disabled = false;
+    }
   });
 }
 
-window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); deferredInstall = e; $('#install-btn').removeClass('d-none'); });
-window.addEventListener('appinstalled', () => { deferredInstall = null; $('#install-btn').addClass('d-none'); UI.toast('App installed'); });
-export async function promptInstall() {
-  if (!deferredInstall) return false;
-  deferredInstall.prompt();
-  await deferredInstall.userChoice;
-  deferredInstall = null; $('#install-btn').addClass('d-none');
-  return true;
-}
-export const canInstall = () => !!deferredInstall;
-
-// ---------- Connection badge ----------
-function renderConn(status) {
-  const map = { online: ['wifi', 'Online'], offline: ['wifi-off', 'Offline'] };
-  const [icon, label] = map[status] || map.offline;
-  $('#conn-badge').attr('class', `badge rounded-pill conn-${status}`).html(`<i class="bi bi-${icon}"></i> <span>${label}</span>`);
-  $('#login-conn').html(navigator.onLine ? '<i class="bi bi-wifi text-success"></i> Online' : '<i class="bi bi-wifi-off text-danger"></i> Offline — connect to the internet to sign in');
-}
-window.addEventListener('online', () => renderConn('online'));
-window.addEventListener('offline', () => renderConn('offline'));
-
-// ---------- Navigation ----------
-function buildMenu() {
-  let html = ''; let section = '';
-  for (const [name, [, title, perm, icon, sec]] of Object.entries(ROUTES)) {
-    if (!sec || (perm && !Auth.can(perm))) continue;
-    if (sec !== section) { section = sec; html += `<div class="nav-section">${esc(sec)}</div>`; }
-    html += `<a class="nav-link" href="#/${name}" data-route="${name}"><i class="bi bi-${icon}"></i>${esc(title)}</a>`;
-  }
-  $('.nav-menu').html(html);
-  const u = Auth.user();
-  $('#user-name').text(u.name);
-  $('#user-role').text(Auth.ROLES[u.role] || u.role);
-  $('#user-avatar').text(UI.initials(u.name));
-  $('#brand-name').text(getSettings().business.name || CONFIG.APP_NAME);
-  $('#bottom-nav [data-route="pos"]').toggleClass('d-none', !Auth.can('sale.create'));
+function brandSvg() {
+  return `<svg viewBox="0 0 48 48" aria-hidden="true"><defs><linearGradient id="bg1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5eead4"/><stop offset="1" stop-color="#0f766e"/></linearGradient></defs>
+    <rect width="48" height="48" rx="13" fill="url(#bg1)"/>
+    <rect x="11" y="13" width="26" height="22" rx="4" fill="none" stroke="#fff" stroke-width="2.4"/>
+    <circle cx="24" cy="24" r="5.4" fill="none" stroke="#fde68a" stroke-width="2"/>
+    <path d="M18.6 24h10.8M24 18.6c-2.2 2-2.2 8.8 0 10.8c2.2-2 2.2-8.8 0-10.8" stroke="#fff" stroke-width="1.2" fill="none"/>
+    <path d="M30.5 15.5l3.5-2.5" stroke="#fde68a" stroke-width="2.2" stroke-linecap="round"/></svg>`;
 }
 
-async function route() {
-  if (!Auth.user()) return;
-  if (checkExpiry()) return;
-  const token = ++routeToken;
-  const parts = (location.hash.replace(/^#\/?/, '') || 'dashboard').split('/').map(decodeURIComponent);
-  const name = ROUTES[parts[0]] ? parts[0] : 'dashboard';
-  const [loader, title, perm] = ROUTES[name];
-  try { currentModule?.destroy?.(); } catch (e) { console.warn(e); }
-  currentModule = null;
-  bootstrap.Offcanvas.getInstance('#menu-offcanvas')?.hide();
-  $('.nav-menu .nav-link, #bottom-nav a').removeClass('active');
-  $(`.nav-menu [data-route="${name}"], #bottom-nav [data-route="${name}"]`).addClass('active');
-  $('body').toggleClass('focus-mode', FOCUS_ROUTES.has(name));
-  $('#topbar-title').text(title);
-  const $c = $('#content').off();
-  if (perm && !Auth.can(perm)) { $c.html(UI.emptyState('You do not have permission to open this page.', 'shield-lock')); return; }
-  $c.html(UI.spinner());
-  try {
-    const mod = (await loader()).default;
-    if (token !== routeToken) return;
-    currentModule = mod;
-    window.scrollTo(0, 0);
-    $c.removeClass('page-enter');
-    await mod.render($c[0], { route: name, params: parts.slice(1), setTitle: (t) => $('#topbar-title').text(t) });
-    if (token === routeToken) { void $c[0].offsetWidth; $c.addClass('page-enter'); }
-  } catch (e) {
-    console.error(e);
-    if (token === routeToken) $c.html(UI.errorState(e));
-  }
+// ---------- App shell ----------
+function buildNav() {
+  const html = NAV.map(([section, items]) => `
+    <div class="nav-section">${esc(section)}</div>
+    ${items.map(([key, ic, label]) => `<a class="nav-link" href="#/${key}" data-route="${key}"><i class="bi bi-${ic}"></i><span>${esc(label)}</span></a>`).join('')}`).join('');
+  $('#sidebar-nav').innerHTML = html;
 }
 
-// ---------- Auth gate ----------
+function paintShell(settings) {
+  const name = settings.agencyName || CONFIG.APP_NAME;
+  $('#brand-name').textContent = name;
+  const acc = settingsCache?.account;
+  const owner = settings.ownerName || acc?.name || 'Owner';
+  $('#user-name').textContent = owner;
+  $('#user-role').textContent = 'Owner · this device';
+  $('#user-avatar').textContent = initials(owner);
+}
+
 async function startApp() {
-  await Catalog.load();
-  buildMenu();
-  showView('app');
-  renderConn(navigator.onLine ? 'online' : 'offline');
+  const [settings, account] = await Promise.all([D.getSettings(), Auth.getAccount()]);
+  await D.seedCatalog();
+  settingsCache = { account };
+  buildNav();
+  paintShell(settings);
+  $('#view-auth').hidden = true;
+  $('#view-app').hidden = false;
+  hideSplash();
   clearInterval(expiryTimer);
-  expiryTimer = setInterval(checkExpiry, 60000);
-  if (navigator.storage?.persist) navigator.storage.persisted().then((p) => { if (!p) navigator.storage.persist().catch(() => {}); });
+  expiryTimer = setInterval(() => { if (!Auth.currentSession()) lock(); }, 60000);
   route();
 }
 
-async function doLogout(forced = false, reason = '') {
-  if (!forced && !await UI.confirmDialog('Log out of this device? Your POS data stays on this device, but signing in again requires an internet connection.', { okLabel: 'Log out', okClass: 'btn-danger' })) return;
+// Session ended (or user pressed Lock). Data is kept; only the screen is locked.
+function lock() {
   clearInterval(expiryTimer);
-  try { currentModule?.destroy?.(); } catch { /* ignore */ }
-  currentModule = null;
-  Auth.logout();
-  $('#content').empty();
-  showLogin(reason);
+  routeToken++;
+  $('#content').innerHTML = '';
+  showAuth('signin', 'Your session has ended. Sign in again to continue.');
 }
 
-// Sessions are valid until expiresAt (set by the server); after that an online sign-in is required.
-let expiryTimer = null;
-function checkExpiry() {
-  if (!Auth.sessionExpired()) return false;
-  UI.toast('Your session has expired. Please sign in again.', 'warning', 6000);
-  doLogout(true, 'Your session has expired. Connect to the internet and sign in again.');
-  return true;
+function logout() {
+  UI.confirmDialog('Sign out of this device? Your data stays here, and you can sign back in with your password.', { okLabel: 'Sign out', title: 'Sign out', danger: false }).then((ok) => {
+    if (!ok) return;
+    Auth.endSession();
+    lock();
+  });
 }
 
-function showLogin(reason = '') {
-  showView('login');
-  renderConn(navigator.onLine ? 'online' : 'offline');
-  const notices = [];
-  if (reason) notices.push(esc(reason));
-  $('#login-notice').toggleClass('d-none', !notices.length).html(notices.join('<br>'));
-  setTimeout(() => $('#login-username').trigger('focus'), 50);
+// ---------- Router ----------
+function parseHash() {
+  const raw = location.hash.replace(/^#\/?/, '');
+  const [pathPart, queryPart] = raw.split('?');
+  const parts = (pathPart || '').split('/').filter(Boolean).map((p) => decodeURIComponent(p));
+  const name = ROUTES[parts[0]] ? parts[0] : 'dashboard';
+  return { name, params: parts.slice(1), query: new URLSearchParams(queryPart || '') };
 }
 
-$('#login-form').on('submit', async (e) => {
-  e.preventDefault();
-  const $btn = $('#login-btn').prop('disabled', true).html('<span class="spinner-border spinner-border-sm"></span><span>Signing in…</span>');
-  $('#login-error').addClass('d-none');
+async function route() {
+  if (!Auth.currentSession()) return lock();
+  const token = ++routeToken;
+  const { name, params, query } = parseHash();
+  const route = ROUTES[name];
+  document.querySelectorAll('[data-route]').forEach((el) => el.classList.toggle('active', el.dataset.route === name));
+  document.body.classList.toggle('case-detail-open', name === 'cases' && params.length > 0);
+  setTitle(route.title);
+  window.scrollTo({ top: 0 });
+  const content = $('#content');
+  content.classList.remove('page-enter');
+  content.innerHTML = UI.skeleton(4);
   try {
-    await Auth.login($('#login-username').val(), $('#login-password').val());
-    $('#login-password').val('');
-    await startApp();
-  } catch (err) {
-    $('#login-error').text(err.message || String(err)).removeClass('d-none');
-    $('.auth-card').removeClass('shake'); void $('.auth-card')[0].offsetWidth; $('.auth-card').addClass('shake');
-  } finally { $btn.prop('disabled', false).html('<span>Sign in</span><i class="bi bi-arrow-right"></i>'); }
-});
-$('#toggle-pw').on('click', () => {
-  const $i = $('#login-password'); const show = $i.attr('type') === 'password';
-  $i.attr('type', show ? 'text' : 'password');
-  $('#toggle-pw i').attr('class', show ? 'bi bi-eye-slash' : 'bi bi-eye');
-});
-$('#logout-btn').on('click', () => doLogout(false));
-$('#install-btn').on('click', promptInstall);
-window.addEventListener('hashchange', route);
-document.addEventListener('settings:changed', () => { applyTheme(); if (Auth.user()) $('#brand-name').text(getSettings().business.name || CONFIG.APP_NAME); });
-document.addEventListener('auth:changed', () => { if (Auth.user()) buildMenu(); });
-window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', applyTheme);
+    const mod = await route.load();
+    if (token !== routeToken) return;
+    await mod.render(content, {
+      params,
+      query,
+      settings: await D.getSettings(),
+      setTitle,
+      refresh: () => route_refresh(),
+      navigate: (hash) => { location.hash = hash; },
+    });
+    if (token !== routeToken) return;
+    void content.offsetWidth;
+    content.classList.add('page-enter');
+    UI.animateCounts(content);
+  } catch (e) {
+    console.error(e);
+    if (token === routeToken) content.innerHTML = UI.emptyState({ iconName: 'exclamation-triangle', title: 'This page could not load', text: e.message || String(e), action: '<button class="btn btn-ghost" onclick="location.reload()">Reload</button>' });
+  }
+}
+// Re-renders the current page after data changes, without changing the URL.
+function route_refresh() { return route(); }
+const refreshSoon = () => route();
+
+function setTitle(t) {
+  const el = $('#topbar-title');
+  if (el) el.textContent = t;
+  document.title = `${t} · ${CONFIG.SHORT_NAME}`;
+}
+
+// ---------- Search & quick actions ----------
+function openSearch() {
+  UI.openSheet({
+    title: 'Search', size: 'lg',
+    html: `<div class="search-box">${UI.icon('search')}<input id="gs" class="input input-search" placeholder="Name, CNIC, phone, passport no. or case no." autocomplete="off" type="search"></div>
+      <div id="gs-results" class="search-results"><div class="muted-note">Type at least 2 letters or 4 digits.</div></div>`,
+    onMount: (el, close) => {
+      const input = el.querySelector('#gs');
+      const box = el.querySelector('#gs-results');
+      const run = debounce(async () => {
+        const q = input.value;
+        if (q.trim().length < 2 && q.replace(/\D/g, '').length < 4) { box.innerHTML = '<div class="muted-note">Type at least 2 letters or 4 digits.</div>'; return; }
+        const { clients, cases } = await D.searchAll(q);
+        const rows = [
+          ...clients.map((c) => `<a class="result-row" href="#/clients/${encodeURIComponent(c.id)}" data-close>${UI.avatar(c.name)}<span class="result-text"><b>${esc(c.name)}</b><small>${esc(c.phone || '')}${c.cnic ? ` · ${esc(c.cnic)}` : ''}</small></span>${UI.icon('chevron-right', 'muted')}</a>`),
+          ...cases.map((c) => `<a class="result-row" href="#/cases/${encodeURIComponent(c.id)}" data-close><span class="result-icon">${UI.icon('briefcase')}</span><span class="result-text"><b>${esc(c.caseNo)}</b><small>${esc(c.flag || '')} ${esc(c.countryName)} · ${esc(c.visaName)}</small></span>${UI.icon('chevron-right', 'muted')}</a>`),
+        ];
+        box.innerHTML = rows.length ? rows.join('') : '<div class="muted-note">No matches. Try another spelling or the case number.</div>';
+        box.querySelectorAll('[data-close]').forEach((a) => a.addEventListener('click', () => close()));
+      }, 160);
+      input.addEventListener('input', run);
+      setTimeout(() => input.focus(), 60);
+    },
+  });
+}
+
+function openQuickAdd() {
+  const items = [
+    ['person-plus', 'New client', 'Add a person and their passport details', () => Forms.openClientForm({ onSaved: refreshSoon })],
+    ['briefcase', 'New visa case', 'Pick a country and visa, then add applicants', () => Forms.openCaseForm({ onSaved: refreshSoon })],
+    ['cash-coin', 'Record payment', 'Cash, bank, JazzCash, Easypaisa or Raast', () => Forms.openPaymentForm({ onSaved: refreshSoon })],
+    ['calendar-plus', 'Add appointment', 'VFS slot, embassy interview or pickup', () => Forms.openAppointmentForm({ onSaved: refreshSoon })],
+    ['check2-square', 'Add task', 'Follow-up call, document chase, reminder', () => Forms.openTaskForm({ onSaved: refreshSoon })],
+    ['receipt', 'Record expense', 'Embassy fee, courier, rent, commission', () => Forms.openExpenseForm({ onSaved: refreshSoon })],
+  ];
+  UI.openSheet({
+    title: 'Add something', size: 'md',
+    html: `<div class="quick-grid">${items.map(([ic, t, d], i) => `<button type="button" class="quick-item reveal" style="--d:${i * 45}ms" data-q="${i}">
+        <span class="quick-icon">${UI.icon(ic)}</span><span><b>${esc(t)}</b><small>${esc(d)}</small></span></button>`).join('')}</div>`,
+    onMount: (el, close) => {
+      el.querySelectorAll('[data-q]').forEach((b) => b.addEventListener('click', () => {
+        close();
+        items[Number(b.dataset.q)][3]();
+      }));
+    },
+  });
+}
+
+function openMore() {
+  const links = NAV.flatMap(([section, items]) => [`<div class="nav-section nav-section-sheet">${esc(section)}</div>`,
+    ...items.map(([key, ic, label]) => `<a class="more-link" href="#/${key}" data-close><span>${UI.icon(ic)}</span>${esc(label)}</a>`)]).join('');
+  UI.openSheet({
+    title: 'Menu', size: 'md',
+    html: `<div class="more-grid">${links}</div>
+      <div class="more-foot"><button type="button" class="btn btn-ghost btn-block" id="more-theme">${UI.icon('moon-stars')} Toggle dark mode</button>
+      <button type="button" class="btn btn-ghost btn-block text-danger" id="more-logout">${UI.icon('box-arrow-right')} Sign out</button></div>`,
+    onMount: (el, close) => {
+      el.querySelectorAll('[data-close]').forEach((a) => a.addEventListener('click', () => close()));
+      el.querySelector('#more-theme').addEventListener('click', toggleTheme);
+      el.querySelector('#more-logout').addEventListener('click', () => { close(); logout(); });
+    },
+  });
+}
 
 // ---------- Boot ----------
+function wireShell() {
+  $('#theme-toggle').addEventListener('click', toggleTheme);
+  $('#search-btn').addEventListener('click', openSearch);
+  $('#quick-btn').addEventListener('click', openQuickAdd);
+  $('#bottom-quick').addEventListener('click', openQuickAdd);
+  $('#bottom-more').addEventListener('click', (e) => { e.preventDefault(); openMore(); });
+  $('#user-menu-btn').addEventListener('click', () => $('#user-menu').classList.toggle('open'));
+  document.addEventListener('click', (e) => { if (!e.target.closest('.user-wrap')) $('#user-menu')?.classList.remove('open'); });
+  $('#lock-btn').addEventListener('click', () => { $('#user-menu').classList.remove('open'); Auth.endSession(); lock(); });
+  $('#logout-btn').addEventListener('click', () => { $('#user-menu').classList.remove('open'); logout(); });
+  window.addEventListener('hashchange', () => { if ($('#view-app').hidden === false) route(); });
+  document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); openSearch(); }
+  });
+  matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', () => {
+    if (!localStorage.getItem(THEME_KEY)) applyTheme();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && !Auth.currentSession() && !$('#view-app').hidden) lock();
+  });
+  $('#menu-toggle').addEventListener('click', () => document.body.classList.toggle('nav-open'));
+  $('#sidebar-backdrop').addEventListener('click', () => document.body.classList.remove('nav-open'));
+  window.addEventListener('online', () => document.body.classList.remove('is-offline'));
+  window.addEventListener('offline', () => document.body.classList.add('is-offline'));
+  if (!navigator.onLine) document.body.classList.add('is-offline');
+}
+
+function registerSW() {
+  if (!('serviceWorker' in navigator) || location.protocol === 'file:') return;
+  navigator.serviceWorker.register('service-worker.js').then((reg) => {
+    reg.update().catch(() => {});
+    setInterval(() => { if (navigator.onLine) reg.update().catch(() => {}); }, 60 * 60 * 1000);
+  }).catch((e) => console.warn('Offline support could not start:', e));
+  let reloading = false;
+  let hadController = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (hadController && !reloading) { reloading = true; location.reload(); }
+    hadController = true;
+  });
+}
+
 (async function boot() {
   applyTheme();
+  wireShell();
   registerSW();
-  if (!window.jQuery || !window.bootstrap) return fatal('Required libraries failed to load. Connect to the internet once so the app can be cached for offline use.');
-  try { await openDB(); } catch (e) { return fatal('Could not open the local database: ' + (e.message || e)); }
-  const { user, reason } = Auth.restoreSession();
-  if (user) {
-    try { await startApp(); } catch (e) { console.error(e); fatal(e.message || String(e)); }
-  } else showLogin(reason);
+  if (!window.matchMedia) return fatal('This browser is too old to run the app.');
+  try {
+    await openDB();
+  } catch (e) {
+    return fatal(e.message || String(e));
+  }
+  try {
+    const account = await Auth.getAccount();
+    if (!account) {
+      await D.seedCatalog();
+      return showAuth('setup');
+    }
+    if (Auth.currentSession()) return await startApp();
+    return showAuth('signin');
+  } catch (e) {
+    console.error(e);
+    fatal(e.message || String(e));
+  }
 })();

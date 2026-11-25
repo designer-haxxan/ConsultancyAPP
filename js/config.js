@@ -1,21 +1,22 @@
-// Deployment configuration.
+// App configuration. Change the agency name in Settings; these defaults are used before setup.
 export const CONFIG = {
-  APP_NAME: 'SaleAPP POS',
-  // Namespace for everything this app stores in the browser. All apps on designer-haxxan.github.io share
-  // one origin (one IndexedDB / LocalStorage / Cache Storage), so every app must use its own unique APP_ID.
-  APP_ID: 'disterp',
-  APP_VERSION: '1.3.2',
+  APP_NAME: 'VisaFlow Pakistan',
+  SHORT_NAME: 'VisaFlow',
+  // Namespace for everything stored in the browser. Every app on the same origin must use its own id.
+  APP_ID: 'visaflow',
+  DB_NAME: 'visaflow_pk',
+  APP_VERSION: '2.0.0',
+  // IndexedDB schema version. Bump it when a store or index is added.
   SCHEMA_VERSION: 1,
   BACKUP_VERSION: 1,
-  // Login API: POST {AUTH_API_BASE}/login. The server does not send CORS headers, so the app must be
-  // served from the same origin (https://eposwala.com) or the API must allow the app's origin.
-  AUTH_API_BASE: 'https://eposwala.com/api',
-  SUPPORT_PHONE: '0302-8863131',
+  CURRENCY: 'PKR',
+  // Login session length on this device. After it ends the owner signs in again with the local password.
+  SESSION_HOURS: 12,
+  PBKDF2_ITERATIONS: 210000,
+  MAX_UPLOAD_MB: 15,
+  // Images above this size are resized before storing to keep the device database small.
+  IMAGE_MAX_SIDE: 1800,
 };
 
-export const CDN = {
-  html5qrcode: 'https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js',
-};
-
-// LocalStorage key inside this app's namespace, e.g. storageKey('settings') -> 'disterp.settings'.
+// LocalStorage key inside this app's namespace, e.g. storageKey('session') -> 'visaflow.session'.
 export const storageKey = (name) => `${CONFIG.APP_ID}.${name}`;

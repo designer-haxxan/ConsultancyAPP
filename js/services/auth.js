@@ -1,115 +1,89 @@
-// Authentication against the eposwala login API (POST {AUTH_API_BASE}/login).
-// One account is bound server-side to one device (deviceId). After a successful online login the
-// session { token, expiresAt, username } is kept in LocalStorage and the POS works offline until
-// expiresAt. Passwords are never stored.
+// Local owner sign-in. The password is stored only as a PBKDF2-SHA256 hash in this browser's database.
+// This protects the screen, not the data: anyone with the device and developer tools can read the database,
+// so use a device lock screen as well.
 import { CONFIG, storageKey } from '../config.js';
-import { AppError } from '../core/utils.js';
+import { metaGet, metaSet } from '../db/idb.js';
 
 const SESSION_KEY = storageKey('session');
-// Device id identifies the PHONE (the server binds the account to it), so it is intentionally shared by all
-// apps on this origin; changing it would make the server reply device_mismatch.
-const DEVICE_KEY = 'minipos.deviceId';
+const LOCK_KEY = storageKey('lock');
+const enc = new TextEncoder();
 
-// Exact error codes returned by the API → user-facing messages.
-const ERRORS = {
-  missing_fields: 'Enter your username and password.',
-  invalid_credentials: 'Wrong username or password.',
-  device_mismatch: `This account is already active on another phone. Call ${CONFIG.SUPPORT_PHONE} for help.`,
-  account_disabled: `This account has been disabled. Call ${CONFIG.SUPPORT_PHONE} for help.`,
-};
-const GENERIC = 'Login failed. Try again.';
+const toB64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const fromB64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 
-export const ROLES = { admin: 'Owner', manager: 'Manager', cashier: 'Cashier' };
+async function derive(password, salt, iterations) {
+  if (!crypto?.subtle) throw new Error('This browser cannot secure the password. Open the app over HTTPS or localhost.');
+  const key = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations, hash: 'SHA-256' }, key, 256);
+  return toB64(bits);
+}
 
-const CASHIER = ['sale.create', 'party.edit', 'voucher.create', 'reports.view'];
-const MANAGER = [...CASHIER, 'sale.edit', 'sale.void', 'sale.return', 'purchase.manage', 'product.edit', 'product.delete',
-  'party.delete', 'voucher.void', 'account.manage', 'stock.adjust', 'reports.profit', 'settings.manage', 'backup.export'];
-const PERMISSIONS = { cashier: CASHIER, manager: MANAGER, admin: ['*'] };
+export async function hasAccount() {
+  return !!(await metaGet('auth'));
+}
 
-let current = null;
+export async function getAccount() {
+  return metaGet('auth', null);
+}
 
-// Stable per-browser device id (sent with every login; the server binds the account to it).
-export function deviceId() {
-  let id = localStorage.getItem(DEVICE_KEY);
-  if (!id) {
-    id = crypto.randomUUID ? crypto.randomUUID() : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`;
-    localStorage.setItem(DEVICE_KEY, id);
+export async function createAccount({ username, password, name }) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iterations = CONFIG.PBKDF2_ITERATIONS;
+  const hash = await derive(password, salt, iterations);
+  const account = { username: username.toLowerCase(), name, salt: toB64(salt), iterations, hash, createdAt: new Date().toISOString() };
+  await metaSet('auth', account);
+  startSession(account.username);
+  return account;
+}
+
+export async function signIn(username, password) {
+  const lock = readLock();
+  if (lock.until > Date.now()) {
+    const secs = Math.ceil((lock.until - Date.now()) / 1000);
+    throw new Error(`Too many attempts. Wait ${secs} seconds and try again.`);
   }
-  return id;
-}
-
-function readSession() {
-  try { return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); } catch { return null; }
-}
-
-// The API identifies a shop account by username; that account owns all POS functions on its device.
-// If the server ever includes a known `role`, it is honoured.
-function toUser(s) {
-  return { id: s.username, name: s.username, username: s.username, role: PERMISSIONS[s.role] ? s.role : 'admin' };
-}
-
-const isValid = (s) => !!(s && typeof s.token === 'string' && s.token && typeof s.username === 'string' && Number(s.expiresAt) > Date.now());
-
-// Returns { user } or { user:null, reason }
-export function restoreSession() {
-  const s = readSession();
-  if (!s) return { user: null };
-  if (!isValid(s)) {
-    localStorage.removeItem(SESSION_KEY);
-    current = null;
-    return { user: null, reason: 'Your session has expired. Connect to the internet and sign in again.' };
+  const acc = await getAccount();
+  const ok = acc && acc.username === username.trim().toLowerCase()
+    && (await derive(password, fromB64(acc.salt), acc.iterations)) === acc.hash;
+  if (!ok) {
+    const fails = lock.fails + 1;
+    localStorage.setItem(LOCK_KEY, JSON.stringify({ fails: fails >= 5 ? 0 : fails, until: fails >= 5 ? Date.now() + 30000 : 0 }));
+    throw new Error('Wrong username or password.');
   }
-  current = toUser(s);
-  return { user: current };
+  localStorage.removeItem(LOCK_KEY);
+  startSession(acc.username);
+  return acc;
 }
 
-export const user = () => current;
-export const expiresAt = () => Number(readSession()?.expiresAt) || 0;
-export const sessionExpired = () => !!current && !isValid(readSession());
-
-export function can(perm) {
-  if (!current) return false;
-  const p = PERMISSIONS[current.role] || [];
-  return p.includes('*') || p.includes(perm);
-}
-export function require(perm) {
-  if (!can(perm)) throw new AppError('You do not have permission for this action.', 'FORBIDDEN');
+export async function changePassword(current, next) {
+  const acc = await getAccount();
+  if ((await derive(current, fromB64(acc.salt), acc.iterations)) !== acc.hash) throw new Error('The current password is wrong.');
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await derive(next, salt, acc.iterations);
+  await metaSet('auth', { ...acc, salt: toB64(salt), hash });
 }
 
-export async function login(username, password) {
-  username = String(username ?? '').trim();
-  password = String(password ?? '');
-  if (!username || !password) throw new AppError(ERRORS.missing_fields);
-  if (!navigator.onLine) throw new AppError('Internet connection is required to sign in.');
-
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 20000);
-  let res;
-  try {
-    res = await fetch(`${CONFIG.AUTH_API_BASE}/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password, deviceId: deviceId() }),
-      credentials: 'omit', cache: 'no-store', signal: ctrl.signal,
-    });
-  } catch {
-    throw new AppError('Could not reach the login server. Check your internet connection and try again.');
-  } finally { clearTimeout(timer); }
-
-  let data = null;
-  try { data = await res.json(); } catch { /* non-JSON response */ }
-  if (!res.ok) throw new AppError(ERRORS[data?.error] || GENERIC);
-
-  const session = { token: data?.token, expiresAt: Number(data?.expiresAt), username: data?.username };
-  if (data?.role) session.role = data.role;
-  if (!isValid(session)) throw new AppError(GENERIC);
-  localStorage.setItem(SESSION_KEY, JSON.stringify(session));
-  current = toUser(session);
-  return current;
+function readLock() {
+  try { return { fails: 0, until: 0, ...JSON.parse(localStorage.getItem(LOCK_KEY) || '{}') }; } catch { return { fails: 0, until: 0 }; }
 }
 
-// Logout only clears the local session (the API has no logout endpoint). The device binding stays on the server.
-export function logout() {
-  localStorage.removeItem(SESSION_KEY);
-  current = null;
+export function startSession(username) {
+  const exp = Date.now() + CONFIG.SESSION_HOURS * 3600 * 1000;
+  try { localStorage.setItem(SESSION_KEY, JSON.stringify({ username, exp })); } catch { /* storage blocked: session lasts this page load */ }
+  sessionMemory = { username, exp };
+}
+let sessionMemory = null;
+
+export function currentSession() {
+  let s = sessionMemory;
+  if (!s) {
+    try { s = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); } catch { s = null; }
+  }
+  if (!s || !s.exp || s.exp < Date.now()) return null;
+  return s;
+}
+
+export function endSession() {
+  sessionMemory = null;
+  try { localStorage.removeItem(SESSION_KEY); } catch { /* ignore */ }
 }

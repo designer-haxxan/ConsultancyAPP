@@ -1,192 +1,305 @@
-// UI helpers: toasts, modals, confirm dialogs, pickers, loading & empty states.
-import { esc, debounce } from './utils.js';
+// UI helpers: toasts, sheets (modal / bottom sheet), confirm dialogs, form fields, badges and animated numbers.
+import { esc, money } from './utils.js';
+import { STAGES, STAGE_BY_KEY } from './constants.js';
 
-const $ = window.jQuery;
+export const icon = (name, cls = '') => `<i class="bi bi-${name} ${cls}" aria-hidden="true"></i>`;
 
-export function toast(message, type = 'success', ms = 3200) {
-  const icons = { success: 'check-circle-fill', danger: 'x-octagon-fill', warning: 'exclamation-triangle-fill', info: 'info-circle-fill' };
-  const $t = $(`<div class="toast align-items-center text-bg-${type} border-0" role="alert" aria-live="assertive" aria-atomic="true">
-      <div class="d-flex"><div class="toast-body"><i class="bi bi-${icons[type] || icons.info} me-2"></i>${esc(message)}</div>
-      <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button></div></div>`);
-  $('#toast-container').append($t);
-  const t = new bootstrap.Toast($t[0], { delay: ms });
-  $t.on('hidden.bs.toast', () => $t.remove());
-  t.show();
-}
-export const toastError = (err) => {
-  console.error(err);
-  toast(err?.message || String(err), 'danger', 5000);
-};
-
-export function modal({ title, body = '', footer = null, size = '', scrollable = true, fullscreenMobile = true, static: isStatic = false }) {
-  const $m = $(`<div class="modal fade" tabindex="-1" aria-hidden="true">
-    <div class="modal-dialog ${size ? 'modal-' + size : ''} ${scrollable ? 'modal-dialog-scrollable' : ''} ${fullscreenMobile ? 'modal-fullscreen-sm-down' : ''} modal-dialog-centered">
-      <div class="modal-content">
-        <div class="modal-header py-2"><h5 class="modal-title">${esc(title)}</h5>
-          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
-        <div class="modal-body">${body}</div>
-        ${footer !== null ? `<div class="modal-footer py-2">${footer}</div>` : ''}
-      </div></div></div>`);
-  $('body').append($m);
-  const bs = new bootstrap.Modal($m[0], isStatic ? { backdrop: 'static', keyboard: false } : {});
-  const closed = new Promise((res) => $m.on('hidden.bs.modal', () => { bs.dispose(); $m.remove(); res(); }));
-  bs.show();
-  return { $el: $m, close: () => bs.hide(), closed, bs };
+// ----- Toasts -----
+export function toast(message, tone = 'success', ms = 3600) {
+  const wrap = document.getElementById('toast-container');
+  if (!wrap) return;
+  const el = document.createElement('div');
+  el.className = `toast-item tone-${tone}`;
+  const iconName = { success: 'check-circle-fill', danger: 'exclamation-octagon-fill', warn: 'exclamation-triangle-fill', info: 'info-circle-fill' }[tone] || 'info-circle-fill';
+  el.innerHTML = `${icon(iconName)}<span>${esc(message)}</span>`;
+  wrap.appendChild(el);
+  requestAnimationFrame(() => el.classList.add('in'));
+  setTimeout(() => { el.classList.remove('in'); el.classList.add('out'); setTimeout(() => el.remove(), 350); }, ms);
 }
 
-// Form dialog. onSubmit receives (values, $el); return a value to close, throw to show an error.
-export function formModal({ title, body, submitLabel = 'Save', submitClass = 'btn-primary', size = '', onSubmit, onShown }) {
+// ----- Sheets (modal on desktop, bottom sheet on phones) -----
+let sheetDepth = 0;
+export function openSheet({ title = '', html = '', size = 'md', footer = '', onMount = null, onClose = null, dismissible = true }) {
+  const root = document.getElementById('sheet-root');
+  const wrap = document.createElement('div');
+  wrap.className = 'sheet-backdrop';
+  wrap.innerHTML = `
+    <section class="sheet sheet-${size}" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+      <header class="sheet-head">
+        <div class="sheet-title">${esc(title)}</div>
+        ${dismissible ? `<button type="button" class="icon-btn" data-close aria-label="Close">${icon('x-lg')}</button>` : ''}
+      </header>
+      <div class="sheet-body">${html}</div>
+      ${footer ? `<footer class="sheet-foot">${footer}</footer>` : ''}
+    </section>`;
+  root.appendChild(wrap);
+  document.body.classList.add('sheet-open');
+  sheetDepth++;
+  requestAnimationFrame(() => wrap.classList.add('in'));
+  let closed = false;
+  const close = (result) => {
+    if (closed) return;
+    closed = true;
+    wrap.classList.remove('in');
+    wrap.classList.add('out');
+    sheetDepth = Math.max(0, sheetDepth - 1);
+    if (!sheetDepth) document.body.classList.remove('sheet-open');
+    setTimeout(() => wrap.remove(), 260);
+    onClose?.(result);
+    document.removeEventListener('keydown', onKey);
+  };
+  const onKey = (e) => { if (e.key === 'Escape' && dismissible) close(); };
+  document.addEventListener('keydown', onKey);
+  wrap.addEventListener('click', (e) => {
+    if (e.target === wrap && dismissible) close();
+    if (e.target.closest('[data-close]')) close();
+  });
+  const sheetEl = wrap.querySelector('.sheet');
+  onMount?.(sheetEl, close);
+  // Focus the first field on desktop only (avoids the phone keyboard popping up).
+  if (window.matchMedia('(min-width: 768px)').matches) setTimeout(() => sheetEl.querySelector('input,select,textarea')?.focus(), 80);
+  return { el: sheetEl, close };
+}
+
+export function confirmDialog(message, { title = 'Please confirm', okLabel = 'Confirm', danger = false, cancelLabel = 'Cancel' } = {}) {
   return new Promise((resolve) => {
-    let result = null;
-    const m = modal({
-      title, size,
-      body: `<form novalidate autocomplete="off">${body}<div class="alert alert-danger py-2 small d-none form-error mt-3 mb-0"></div><button type="submit" class="d-none"></button></form>`,
-      footer: `<button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button>
-               <button type="button" class="btn ${submitClass} btn-submit">${esc(submitLabel)}</button>`,
+    const sheet = openSheet({
+      title, size: 'sm', dismissible: true,
+      html: `<p class="confirm-text">${esc(message)}</p>`,
+      footer: `<button type="button" class="btn btn-ghost" data-close>${esc(cancelLabel)}</button>
+               <button type="button" class="btn ${danger ? 'btn-danger' : 'btn-primary'}" data-ok>${esc(okLabel)}</button>`,
+      onMount: (el, close) => el.querySelector('[data-ok]').addEventListener('click', () => { resolve(true); close(true); }),
+      onClose: (r) => { if (!r) resolve(false); },
     });
-    const $f = m.$el.find('form');
-    m.$el.on('shown.bs.modal', () => { onShown ? onShown(m.$el) : m.$el.find('input,select,textarea').filter(':visible').first().trigger('focus'); });
-    let busy = false;
-    const submit = async (e) => {
-      e?.preventDefault();
-      if (busy) return;
-      busy = true;
-      const $btn = m.$el.find('.btn-submit').prop('disabled', true);
-      m.$el.find('.form-error').addClass('d-none');
-      try {
-        const values = Object.fromEntries(new FormData($f[0]).entries());
-        $f.find('input[type=checkbox]').each(function () { values[this.name] = this.checked; });
-        const r = await onSubmit(values, m.$el);
-        if (r !== undefined && r !== false) { result = r; m.close(); }
-      } catch (err) {
-        console.warn(err);
-        m.$el.find('.form-error').text(err.message || String(err)).removeClass('d-none');
-      } finally { busy = false; $btn.prop('disabled', false); }
-    };
-    $f.on('submit', submit);
-    m.$el.find('.btn-submit').on('click', submit);
-    m.closed.then(() => resolve(result));
+    return sheet;
   });
 }
 
-export function confirmDialog(message, { title = 'Please confirm', okLabel = 'Confirm', okClass = 'btn-primary', html = false } = {}) {
+// Typed confirmation for destructive actions (e.g. reset all data).
+export function typedConfirm(message, word, { okLabel = 'Delete', title = 'Confirm deletion' } = {}) {
   return new Promise((resolve) => {
-    let ok = false;
-    const m = modal({
-      title, fullscreenMobile: false, scrollable: false,
-      body: html ? message : `<p class="mb-0">${esc(message)}</p>`,
-      footer: `<button class="btn btn-light" data-bs-dismiss="modal">Cancel</button><button class="btn ${okClass} btn-ok">${esc(okLabel)}</button>`,
+    openSheet({
+      title, size: 'sm',
+      html: `<p class="confirm-text">${esc(message)}</p>
+             <label class="field-label">Type <b>${esc(word)}</b> to confirm</label>
+             <input class="input" id="typed-word" autocomplete="off">`,
+      footer: `<button type="button" class="btn btn-ghost" data-close>Cancel</button>
+               <button type="button" class="btn btn-danger" data-ok disabled>${esc(okLabel)}</button>`,
+      onMount: (el, close) => {
+        const input = el.querySelector('#typed-word');
+        const ok = el.querySelector('[data-ok]');
+        input.addEventListener('input', () => { ok.disabled = input.value.trim() !== word; });
+        ok.addEventListener('click', () => { resolve(true); close(true); });
+      },
+      onClose: (r) => { if (!r) resolve(false); },
     });
-    m.$el.find('.btn-ok').on('click', () => { ok = true; m.close(); });
-    m.closed.then(() => resolve(ok));
   });
 }
 
-// Searchable list picker. search(q) => [{id, title, subtitle, right, value}]
-export function pick({ title, search, noneLabel = null, placeholder = 'Search…', addNew = null }) {
+// Re-renders a page while keeping the caret in a search box the user is typing in.
+export async function rerenderKeepingFocus(root, selector, fn) {
+  const el = root.querySelector(selector);
+  const focused = !!el && document.activeElement === el;
+  const pos = el ? el.selectionStart ?? el.value.length : 0;
+  await fn();
+  if (focused) {
+    const next = root.querySelector(selector);
+    if (next) {
+      next.focus();
+      try { next.setSelectionRange(pos, pos); } catch { /* not a text input */ }
+    }
+  }
+}
+
+// Asks for one line of text in a small sheet. Resolves with the text, or null if cancelled.
+export function askText({ title = 'Enter a value', label = '', value = '', okLabel = 'Save', danger = false } = {}) {
   return new Promise((resolve) => {
-    let result; // undefined = cancelled
-    const m = modal({
-      title, size: 'md',
-      body: `<input type="search" class="form-control form-control-lg mb-2 pick-q" placeholder="${esc(placeholder)}" autocomplete="off">
-        ${addNew ? `<button class="btn btn-outline-primary w-100 mb-2 pick-add"><i class="bi bi-plus-lg me-1"></i>${esc(addNew.label)}</button>` : ''}
-        ${noneLabel ? `<button class="list-group-item list-group-item-action rounded border mb-2 w-100 text-start pick-none"><i class="bi bi-dash-circle me-2"></i>${esc(noneLabel)}</button>` : ''}
-        <div class="list-group pick-list"></div>`,
+    openSheet({
+      title, size: 'sm',
+      html: `<div class="field"><label class="field-label" for="ask-text">${esc(label)}</label>
+             <textarea class="input" id="ask-text" rows="3">${esc(value)}</textarea></div>`,
+      footer: `<button type="button" class="btn btn-ghost" data-close>Cancel</button>
+               <button type="button" class="btn ${danger ? 'btn-danger' : 'btn-primary'}" data-ok>${esc(okLabel)}</button>`,
+      onMount: (el, close) => {
+        const ta = el.querySelector('#ask-text');
+        el.querySelector('[data-ok]').addEventListener('click', () => { resolve(ta.value.trim()); close(true); });
+      },
+      onClose: (r) => { if (!r) resolve(null); },
     });
-    let items = [];
-    const render = async () => {
-      items = await search(m.$el.find('.pick-q').val().trim());
-      m.$el.find('.pick-list').html(items.length ? items.map((it, i) => `
-        <button type="button" class="list-group-item list-group-item-action d-flex justify-content-between align-items-center py-2" data-i="${i}">
-          <div class="text-truncate me-2"><div class="fw-semibold text-truncate">${esc(it.title)}</div>${it.subtitle ? `<div class="small text-body-secondary text-truncate">${esc(it.subtitle)}</div>` : ''}</div>
-          ${it.right ? `<div class="small text-nowrap">${esc(it.right)}</div>` : ''}</button>`).join('') : emptyState('No matches found', 'search'));
-    };
-    m.$el.on('input', '.pick-q', debounce(render, 150));
-    m.$el.on('keydown', '.pick-q', (e) => { if (e.key === 'Enter' && items.length) { e.preventDefault(); result = items[0]; m.close(); } });
-    m.$el.on('click', '.pick-list [data-i]', function () { result = items[+this.dataset.i]; m.close(); });
-    m.$el.on('click', '.pick-none', () => { result = null; m.close(); });
-    let adding = false;
-    m.$el.on('click', '.pick-add', async () => {
-      adding = true;
-      m.close(); await m.closed;
-      const created = await addNew.create();
-      resolve(created || undefined);
-    });
-    m.$el.on('shown.bs.modal', () => m.$el.find('.pick-q').trigger('focus'));
-    render();
-    m.closed.then(() => { if (!adding) resolve(result); });
   });
 }
 
-export function emptyState(text, icon = 'inbox', action = '') {
-  return `<div class="empty-state text-center text-body-secondary"><div class="es-icon"><i class="bi bi-${icon}"></i></div><div class="fw-medium">${esc(text)}</div>${action}</div>`;
+// ----- Layout fragments -----
+export function pageHead({ title, sub = '', actions = '', back = '' }) {
+  return `<header class="page-head reveal">
+    <div class="page-head-text">
+      ${back ? `<a class="back-link" href="${back}">${icon('chevron-left')} Back</a>` : ''}
+      <h1 class="page-title">${esc(title)}</h1>
+      ${sub ? `<p class="page-sub">${sub}</p>` : ''}
+    </div>
+    ${actions ? `<div class="page-actions">${actions}</div>` : ''}
+  </header>`;
 }
-export function errorState(err) {
-  return `<div class="alert alert-danger m-3"><i class="bi bi-exclamation-octagon me-2"></i>${esc(err?.message || err)}</div>`;
-}
-// Skeleton placeholder while a page loads (text is kept for screen readers).
-export const spinner = (text = 'Loading…') => `<div class="skeleton py-2" role="status" aria-label="${esc(text)}">
-  <div class="skel" style="height:28px;width:40%"></div><div class="skel" style="height:110px"></div>
-  <div class="d-flex gap-2"><div class="skel flex-fill" style="height:70px"></div><div class="skel flex-fill" style="height:70px"></div></div>
-  <div class="skel" style="height:220px"></div></div>`;
 
-// Coloured initials avatar; the colour is derived from the name so it stays the same everywhere.
-const TINTS = ['indigo', 'violet', 'green', 'amber', 'cyan', 'pink', 'red', 'slate'];
-export function tintFor(name) {
-  let h = 0;
-  for (const ch of String(name || '')) h = (h * 31 + ch.codePointAt(0)) >>> 0;
-  return TINTS[h % TINTS.length];
+export function emptyState({ iconName = 'inbox', title = 'Nothing here yet', text = '', action = '' }) {
+  return `<div class="empty reveal">
+    <div class="empty-icon">${icon(iconName)}</div>
+    <div class="empty-title">${esc(title)}</div>
+    ${text ? `<div class="empty-text">${esc(text)}</div>` : ''}
+    ${action ? `<div class="mt-3">${action}</div>` : ''}
+  </div>`;
 }
-export function initials(name) {
-  const words = String(name || '?').trim().split(/\s+/).filter(Boolean);
-  return ((words[0]?.[0] || '?') + (words.length > 1 ? words[words.length - 1][0] : '')).toUpperCase();
-}
-export const avatar = (name, cls = '') => `<div class="avatar tint-${tintFor(name)} ${cls}" aria-hidden="true">${esc(initials(name))}</div>`;
 
-// Animate numbers in [data-count] elements from 0 to their value (formatted by fmt). Skipped for reduced motion.
-export function countUp(root, fmt) {
-  const els = root.querySelectorAll('[data-count]');
-  const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  els.forEach((el) => {
-    const end = Number(el.dataset.count) || 0;
-    if (reduce || !end) { el.textContent = fmt(end, el); return; }
-    const t0 = performance.now(); const dur = 700;
+export const skeleton = (n = 3) => `<div class="skeleton-wrap">${Array.from({ length: n }, () => '<div class="skeleton"></div>').join('')}</div>`;
+
+export function chip(text, tone = 'neutral', iconName = '') {
+  return `<span class="chip chip-${tone}">${iconName ? icon(iconName) : ''}${esc(text)}</span>`;
+}
+
+export function avatar(name = '', tone = 0) {
+  const tones = ['a1', 'a2', 'a3', 'a4', 'a5', 'a6'];
+  const ini = (name || '?').trim().split(/\s+/).slice(0, 2).map((p) => p[0] || '').join('').toUpperCase() || '?';
+  return `<span class="avatar ${tones[tone % tones.length]}">${esc(ini)}</span>`;
+}
+
+export function stageBadge(stageKey) {
+  const s = STAGE_BY_KEY[stageKey] || STAGES[0];
+  return `<span class="stage-badge" style="--stage:${s.color}">${icon(s.icon)}${esc(s.label)}</span>`;
+}
+
+export function outcomeChip(outcome) {
+  const map = {
+    approved: ['Approved', 'success', 'check-circle'],
+    refused: ['Refused', 'danger', 'x-circle'],
+    withdrawn: ['Withdrawn', 'muted', 'dash-circle'],
+    pending: ['Pending', 'info', 'clock'],
+  };
+  const [label, tone, ic] = map[outcome] || map.pending;
+  return chip(label, tone, ic);
+}
+
+export function progress(pctValue, tone = 'brand') {
+  const v = Math.max(0, Math.min(100, Math.round(pctValue || 0)));
+  return `<div class="progress-track" role="progressbar" aria-valuenow="${v}" aria-valuemin="0" aria-valuemax="100"><span class="progress-fill tone-${tone}" style="--w:${v}%"></span></div>`;
+}
+
+export function statTile({ label, value, iconName, tone = 'brand', sub = '', count = false, isMoney = false }) {
+  return `<article class="stat-tile tone-${tone} reveal">
+    <div class="stat-icon">${icon(iconName)}</div>
+    <div class="stat-body">
+      <div class="stat-label">${esc(label)}</div>
+      <div class="stat-value" ${count ? `data-count="${Number(value) || 0}" ${isMoney ? 'data-fmt="money"' : ''}` : ''}>${count ? (isMoney ? money(0) : 0) : esc(value)}</div>
+      ${sub ? `<div class="stat-sub">${sub}</div>` : ''}
+    </div>
+  </article>`;
+}
+
+// Animates every [data-count] element up to its value (once per render).
+export function animateCounts(root = document) {
+  root.querySelectorAll('[data-count]').forEach((el) => {
+    const target = Number(el.dataset.count) || 0;
+    const fmt = el.dataset.fmt === 'money' ? money : (n) => Math.round(n).toLocaleString('en-PK');
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches || target === 0) { el.textContent = fmt(target); return; }
+    const start = performance.now();
+    const dur = 900;
     const step = (t) => {
-      const p = Math.min(1, (t - t0) / dur); const e = 1 - Math.pow(1 - p, 3);
-      el.textContent = fmt(p < 1 ? end * e : end, el);
+      const p = Math.min(1, (t - start) / dur);
+      const eased = 1 - Math.pow(1 - p, 3);
+      el.textContent = fmt(target * eased);
       if (p < 1) requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
   });
 }
 
-let loadingCount = 0;
-export function loading(on, text = 'Please wait…') {
-  loadingCount = Math.max(0, loadingCount + (on ? 1 : -1));
-  $('#loading-overlay').toggleClass('d-none', loadingCount === 0).find('.loading-text').text(text);
-}
-export async function withLoading(fn, text) {
-  loading(true, text);
-  try { return await fn(); } finally { loading(false); }
+// ----- Forms -----
+// field({name, label, value, type, required, options, placeholder, hint, full, rows, min, max, step, autocomplete, pattern})
+export function field(o) {
+  const id = `f_${o.name}`;
+  const req = o.required ? ' required' : '';
+  const cls = `field ${o.full ? 'field-full' : ''} ${o.className || ''}`;
+  const val = o.value ?? '';
+  const hint = o.hint ? `<div class="field-hint">${esc(o.hint)}</div>` : '';
+  const dataAttrs = [
+    o.num ? 'data-num="1"' : '',
+    o.dir ? `dir="${o.dir}"` : '',
+    o.mask ? `data-mask="${o.mask}"` : '',
+  ].join(' ');
+  if (o.type === 'select') {
+    const opts = o.options.map((opt) => {
+      const [v, l] = Array.isArray(opt) ? opt : [opt, opt];
+      return `<option value="${esc(v)}" ${String(v) === String(val) ? 'selected' : ''}>${esc(l)}</option>`;
+    }).join('');
+    return `<div class="${cls}"><label class="field-label" for="${id}">${esc(o.label)}${o.required ? ' <span class="req">*</span>' : ''}</label>
+      <select class="input" id="${id}" name="${o.name}"${req} ${dataAttrs}>${o.placeholder ? `<option value="">${esc(o.placeholder)}</option>` : ''}${opts}</select>${hint}</div>`;
+  }
+  if (o.type === 'textarea') {
+    return `<div class="${cls}"><label class="field-label" for="${id}">${esc(o.label)}${o.required ? ' <span class="req">*</span>' : ''}</label>
+      <textarea class="input" id="${id}" name="${o.name}" rows="${o.rows || 3}" placeholder="${esc(o.placeholder || '')}"${req} ${dataAttrs}>${esc(val)}</textarea>${hint}</div>`;
+  }
+  if (o.type === 'checkbox') {
+    return `<label class="${cls} check-field"><input type="checkbox" name="${o.name}" ${val ? 'checked' : ''}><span>${esc(o.label)}</span></label>${hint}`;
+  }
+  const type = o.type || 'text';
+  const extra = [
+    o.min !== undefined ? `min="${o.min}"` : '',
+    o.max !== undefined ? `max="${o.max}"` : '',
+    o.step ? `step="${o.step}"` : '',
+    o.pattern ? `pattern="${o.pattern}"` : '',
+    o.autocomplete ? `autocomplete="${o.autocomplete}"` : 'autocomplete="off"',
+    o.capture ? `capture="${o.capture}"` : '',
+  ].join(' ');
+  return `<div class="${cls}"><label class="field-label" for="${id}">${esc(o.label)}${o.required ? ' <span class="req">*</span>' : ''}</label>
+    <input class="input" type="${type}" id="${id}" name="${o.name}" value="${esc(val)}" placeholder="${esc(o.placeholder || '')}"${req} ${extra} ${dataAttrs}>${hint}</div>`;
 }
 
-export function pageHeader(title, actions = '', back = null) {
-  return `<div class="page-header d-flex align-items-center gap-2 mb-3">
-    ${back ? `<a href="${esc(back)}" class="btn btn-light btn-sm" aria-label="Back"><i class="bi bi-arrow-left"></i></a>` : ''}
-    <h1 class="h5 mb-0 flex-grow-1 text-truncate">${esc(title)}</h1>
-    <div class="d-flex gap-2 flex-shrink-0">${actions}</div></div>`;
+// Reads a form into a plain object. Fields with data-num become numbers, empty numbers become 0.
+export function readForm(form) {
+  const out = {};
+  for (const el of form.elements) {
+    if (!el.name) continue;
+    if (el.type === 'checkbox') out[el.name] = el.checked;
+    else if (el.type === 'file') continue;
+    else if (el.dataset.num) out[el.name] = el.value === '' ? 0 : parseFloat(String(el.value).replace(/,/g, '')) || 0;
+    else out[el.name] = String(el.value ?? '').trim();
+  }
+  return out;
 }
 
-// Build a <select> options list.
-export const options = (list, selected, valueKey = 'id', labelKey = 'name') =>
-  list.map((o) => `<option value="${esc(o[valueKey])}" ${String(o[valueKey]) === String(selected) ? 'selected' : ''}>${esc(o[labelKey])}</option>`).join('');
+// Keeps CNIC and phone inputs formatted while typing.
+export function bindMasks(root) {
+  root.querySelectorAll('[data-mask]').forEach((el) => {
+    el.addEventListener('input', () => {
+      if (el.dataset.mask === 'cnic') {
+        const pos = el.selectionStart;
+        const digitsBefore = el.value.slice(0, pos).replace(/\D/g, '').length;
+        const v = el.value.replace(/[^\d-]/g, '').replace(/\D/g, '').slice(0, 13);
+        const f = v.length <= 5 ? v : v.length <= 12 ? `${v.slice(0, 5)}-${v.slice(5)}` : `${v.slice(0, 5)}-${v.slice(5, 12)}-${v.slice(12)}`;
+        el.value = f;
+        const caret = digitsBefore <= 5 ? digitsBefore : digitsBefore <= 12 ? digitsBefore + 1 : digitsBefore + 2;
+        el.setSelectionRange(caret, caret);
+      }
+    });
+  });
+}
 
-export function beep() {
-  try {
-    const ctx = beep.ctx || (beep.ctx = new (window.AudioContext || window.webkitAudioContext)());
-    const o = ctx.createOscillator(); const g = ctx.createGain();
-    o.frequency.value = 1400; g.gain.value = 0.08;
-    o.connect(g); g.connect(ctx.destination); o.start(); o.stop(ctx.currentTime + 0.08);
-  } catch { /* audio unavailable */ }
-  if (navigator.vibrate) navigator.vibrate(40);
+// Sets the custom validity message so the browser shows Pakistani format hints.
+export function validateSpecial(form) {
+  for (const el of form.querySelectorAll('[data-mask="cnic"]')) {
+    el.setCustomValidity(el.value && !/^\d{5}-\d{7}-\d$/.test(el.value) ? 'CNIC must be 13 digits: 12345-1234567-1' : '');
+  }
+  for (const el of form.querySelectorAll('[data-mask="phone"]')) {
+    const d = el.value.replace(/\D/g, '');
+    el.setCustomValidity(el.value && !(d.length === 11 && d.startsWith('03')) && !(d.startsWith('92') && d.length === 12) ? 'Enter a Pakistani mobile number, e.g. 0300 1234567' : '');
+  }
+}
+
+export function stageSelectOptions(current) {
+  return STAGES.map((s) => [s.key, s.label]).map(([v, l]) => `<option value="${v}" ${v === current ? 'selected' : ''}>${esc(l)}</option>`).join('');
+}
+
+// Simple tab strip; items: [{key, label, icon, count}]
+export function tabStrip(items, active, hashBase) {
+  return `<nav class="tabs" role="tablist">${items.map((t) => `<a role="tab" class="tab ${t.key === active ? 'active' : ''}" href="${hashBase}${t.key}" aria-selected="${t.key === active}">
+      ${t.icon ? icon(t.icon) : ''}<span>${esc(t.label)}</span>${t.count !== undefined ? `<span class="tab-count">${t.count}</span>` : ''}</a>`).join('')}</nav>`;
 }
